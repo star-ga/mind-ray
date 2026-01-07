@@ -1,0 +1,159 @@
+{
+  "version": "2.1",
+  "engines": {
+    "mindray_cuda": {
+      "name": "Mind-Ray CUDA",
+      "status": "available",
+      "tier": "A",
+      "timing_method": "QueryPerformanceCounter + cudaDeviceSynchronize",
+      "executable": "cuda_benchmark.exe",
+      "cli_template": "--scene {scene} --spheres {spheres} --width {width} --height {height} --spp {spp} --bounces {bounces}",
+      "output_parser": "mindray",
+      "supports_kernel_timing": true
+    },
+    "cuda_reference": {
+      "name": "CUDA Reference",
+      "status": "available",
+      "tier": "A",
+      "timing_method": "cudaEventElapsedTime",
+      "executable": "bin/cuda_reference.exe",
+      "cli_template": "--scene {scene} --spheres {spheres} --w {width} --h {height} --spp {spp} --bounces {bounces} --frames {frames}",
+      "output_parser": "cuda_ref",
+      "supports_kernel_timing": true
+    },
+    "optix_sdk": {
+      "name": "OptiX SDK Path Tracer",
+      "status": "available",
+      "tier": "A",
+      "timing_method": "cudaEventElapsedTime",
+      "executable": "engines/optix/build/optix_benchmark.exe",
+      "cli_template": "--scene {scene} --spheres {spheres} --width {width} --height {height} --spp {spp} --bounces {bounces} --frames {frames}",
+      "output_parser": "optix",
+      "supports_kernel_timing": true
+    },
+    "pbrt_v4": {
+      "name": "PBRT-v4",
+      "status": "blocked",
+      "tier": "B",
+      "device": "GPU",
+      "timing_method": "End-to-end wall clock",
+      "source": "https://github.com/mmp/pbrt-v4",
+      "build_script": "engines/pbrt-v4/build.ps1",
+      "run_script": "engines/pbrt-v4/run.ps1",
+      "install_notes": "Requires CUDA Toolkit + OptiX SDK 7.1+. Run build.ps1 to build with GPU support.",
+      "supports_kernel_timing": false,
+      "gpu_requirements": "NVCC + OptiX SDK 7.1+",
+      "blocked_reason": "Toolchain incompatibility: CUDA 12.8 nvcc + VS 2022 Preview (14.44) fails on C++20 std::ranges headers",
+      "recovery_steps": [
+        "Try VS 2022 stable toolset (17.8-17.11) instead of Preview",
+        "Try CUDA 12.4 or 12.5 instead of 12.8",
+        "Try OptiX 8.1 (legacy) instead of 9.1",
+        "Try a known-good PBRT-v4 commit"
+      ]
+    },
+    "mitsuba3": {
+      "name": "Mitsuba 3",
+      "status": "available",
+      "tier": "B",
+      "timing_method": "End-to-end wall clock",
+      "source": "https://github.com/mitsuba-renderer/mitsuba3",
+      "build_script": "engines/mitsuba3/build.ps1",
+      "run_script": "engines/mitsuba3/run.ps1",
+      "install_notes": "Build from source or pip install mitsuba",
+      "supports_kernel_timing": false
+    },
+    "luxcore": {
+      "name": "LuxCoreRender",
+      "status": "available",
+      "tier": "B",
+      "device": "GPU",
+      "timing_method": "End-to-end wall clock",
+      "source": "https://luxcorerender.org/download/",
+      "run_script": "engines/luxcore/run.ps1",
+      "install_notes": "Download from luxcorerender.org and extract to bench/third_party/luxcorerender",
+      "supports_kernel_timing": false,
+      "notes": "First run compiles OpenCL kernels (~2 min). WARM timing uses cached kernels."
+    },
+    "cycles": {
+      "name": "Blender Cycles",
+      "status": "available",
+      "tier": "B",
+      "timing_method": "End-to-end wall clock",
+      "source": "https://www.blender.org/download/",
+      "run_script": "engines/cycles/run.ps1",
+      "install_notes": "Requires Blender 5.0+ installed",
+      "supports_kernel_timing": false
+    },
+    "falcor": {
+      "name": "NVIDIA Falcor",
+      "status": "available",
+      "version": "8.0 (eb540f6)",
+      "tier": "B",
+      "device": "GPU",
+      "timing_method": "End-to-end wall clock",
+      "source": "https://github.com/NVIDIAGameWorks/Falcor",
+      "build_script": "engines/falcor/build.ps1",
+      "run_script": "engines/falcor/run.ps1",
+      "executable": "third_party/falcor/build/windows-vs2022/bin/Release/Mogwai.exe",
+      "install_notes": "Built via setup_vs2022.bat + MSBuild Release.",
+      "supports_kernel_timing": false,
+      "notes": "Uses D3D12 DXR raytracing with PathTracer pass. Headless rendering via Mogwai."
+    },
+    "python_ref": {
+      "name": "Python Reference",
+      "status": "available",
+      "tier": "B",
+      "device": "CPU",
+      "timing_method": "End-to-end wall clock",
+      "run_script": "engines/python_ref/run.ps1",
+      "install_notes": "Requires Python + NumPy",
+      "supports_kernel_timing": false
+    },
+    "mindray_tier_b": {
+      "name": "Mind-Ray Tier B",
+      "status": "available",
+      "tier": "B",
+      "timing_method": "End-to-end wall clock",
+      "run_script": "engines/mindray_tier_b/run.ps1",
+      "install_notes": "Uses cuda_benchmark.exe with wall clock wrapper",
+      "supports_kernel_timing": false
+    },
+    "mindray_tier_bp": {
+      "name": "Mind-Ray Tier BP",
+      "status": "available",
+      "tier": "BP",
+      "timing_method": "Persistent cold start + steady state",
+      "run_script": "engines/mindray_tier_bp/run.ps1",
+      "install_notes": "Uses cuda_benchmark.exe with --tier-bp flag",
+      "supports_kernel_timing": false
+    },
+    "mitsuba3_bp": {
+      "name": "Mitsuba 3 Tier BP",
+      "status": "available",
+      "tier": "BP",
+      "timing_method": "Persistent cold start + steady state",
+      "run_script": "engines/mitsuba3/run_bp.ps1",
+      "install_notes": "Uses benchmark_runner_bp.py",
+      "supports_kernel_timing": false
+    }
+  },
+  "default_params": {
+    "width": 640,
+    "height": 360,
+    "spp": 64,
+    "bounces": 4,
+    "spheres": 50,
+    "frames": 5,
+    "runs": 3,
+    "warmup_runs": 1,
+    "cooldown_sec": 3
+  },
+  "scenes": ["spheres", "stress"],
+  "scaling_sweep": [16, 32, 64, 128, 256],
+  "notes": {
+    "tier_a": "Kernel-only timing. CUDA events or QPC with cudaDeviceSynchronize.",
+    "tier_b": "End-to-end wall clock. Includes BVH build, setup, I/O.",
+    "tier_bp": "Persistent mode. Cold start + steady-state per-frame (median, P95).",
+    "rule": "Never compare Tier A with Tier B or BP numbers."
+  }
+}

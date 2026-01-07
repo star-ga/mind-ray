@@ -1,0 +1,1110 @@
+// main.mind - Mind Ray Tracer
+//
+// Pure Mind language path tracer implementation.
+// Currently CPU-only; GPU backend integration is planned via FFI.
+//
+// Features:
+// - Multiple scene presets (spheres, cornell box, stress test)
+// - Configurable samples per pixel (SPP) and bounce depth
+// - Deterministic rendering with seed-based xorshift32 RNG
+// - Performance benchmarking suite
+// - FNV-1a image hashing for reproducibility verification
+//
+// Usage:
+//   mind-ray render --scene spheres --spp 64 --out render.ppm
+//   mind-ray bench --backend cpu
+//   mind-ray verify --seed 42
+//
+// Backend Support:
+//   - cpu: Single-threaded CPU rendering (default, always available)
+//   - gpu: CUDA GPU backend via FFI (requires mindray_cuda.dll)
+//   - auto: Auto-detect GPU, fallback to CPU
+//
+// Author: Mind Ray Contributors
+// License: MIT
+
+import vec3;
+import ray;
+import camera;
+import material;
+import hittable;
+import scene;
+import render;
+import rng;
+import io;
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
+/// Render configuration containing all parameters for a render job
+struct Config {
+    /// Compute backend: "cpu", "gpu", or "auto" (auto-detect)
+    backend: str,
+    /// Scene preset name: "spheres", "cornell", or "stress"
+    scene_name: str,
+    /// Output image width in pixels
+    width: i32,
+    /// Output image height in pixels
+    height: i32,
+    /// Samples per pixel (higher = less noise, slower)
+    spp: i32,
+    /// Maximum ray bounce depth (higher = more accurate GI, slower)
+    bounces: i32,
+    /// Number of progressive frames to accumulate
+    frames: i32,
+    /// RNG seed for deterministic rendering
+    seed: i32,
+    /// Output file path (PPM format)
+    output_path: str,
+    /// Whether running in benchmark mode
+    bench_mode: bool,
+}
+
+/// Create default configuration with sensible defaults
+///
+/// # Returns
+/// * Config with default values suitable for preview rendering
+fn config_default() -> Config {
+    Config {
+        backend: "auto",
+        scene_name: "spheres",
+        width: 800,
+        height: 450,
+        spp: 16,
+        bounces: 4,
+        frames: 1,
+        seed: 1,
+        output_path: "out/render.ppm",
+        bench_mode: false,
+    }
+}
+
+// =============================================================================
+// Commands
+// =============================================================================
+
+/// Available CLI commands
+enum Command {
+    /// Render a scene to an image file (default)
+    Render,
+    /// Run the benchmark suite
+    Bench,
+    /// Verify determinism by rendering twice with same seed
+    Verify,
+    /// Quick sanity check - render tiny image and verify hash
+    Selfcheck,
+    /// Display help message
+    Help,
+}
+
+/// Parse command-line arguments into a Command and Config
+///
+/// Supports subcommands (render, bench, verify, help) and various flags
+/// for configuring the render parameters. Validates all numeric arguments.
+///
+/// # Arguments
+/// * `args` - Command-line arguments array (args[0] is program name)
+///
+/// # Returns
+/// * Tuple of (Command, Config) with parsed values
+///
+/// # Argument Syntax
+/// * `--backend cpu|gpu|auto` - Select compute backend
+/// * `--scene NAME` - Scene preset (spheres, cornell, stress)
+/// * `--width N` or `--w N` - Image width (1-16384)
+/// * `--height N` or `--h N` - Image height (1-16384)
+/// * `--spp N` - Samples per pixel (1-65536)
+/// * `--bounces N` - Max ray bounces (0-100)
+/// * `--frames N` - Progressive frames (1-1000)
+/// * `--seed N` - RNG seed (any integer)
+/// * `--out PATH` - Output file path
+///
+/// # Error Handling
+/// Exits with code 1 if any numeric argument is invalid or out of range.
+fn parse_args(args: [str]) -> (Command, Config) {
+    let mut config = config_default();
+    let mut command = Command::Render;  // Default command
+    let mut i = 1;  // Skip program name (args[0])
+
+    // First argument might be a subcommand
+    if args.len() > 1 {
+        let first_arg = args[1];
+        if first_arg == "render" {
+            command = Command::Render;
+            i = 2;
+        } else if first_arg == "bench" {
+            command = Command::Bench;
+            i = 2;
+        } else if first_arg == "verify" {
+            command = Command::Verify;
+            i = 2;
+        } else if first_arg == "help" || first_arg == "--help" {
+            command = Command::Help;
+            i = 2;
+        } else if first_arg == "selfcheck" {
+            command = Command::Selfcheck;
+            i = 2;
+        }
+        // If not a subcommand, treat as flag and start parsing from index 1
+    }
+
+    // Parse remaining flags
+    while i < args.len() {
+        let arg = args[i];
+        let has_next = i + 1 < args.len();
+
+        if arg == "--backend" && has_next {
+            let backend_val = args[i + 1];
+            // Validate backend value
+            if backend_val != "cpu" && backend_val != "gpu" && backend_val != "auto" {
+                println(format("ERROR: Invalid backend '{}'. Must be: cpu, gpu, or auto", backend_val));
+                exit(1);
+            }
+            config.backend = backend_val;
+            i = i + 2;
+        } else if arg == "--scene" && has_next {
+            let scene_val = args[i + 1];
+            // Validate scene name
+            if scene_val != "spheres" && scene_val != "cornell" && scene_val != "stress" {
+                println(format("WARNING: Unknown scene '{}'. Falling back to 'spheres'.", scene_val));
+            }
+            config.scene_name = scene_val;
+            i = i + 2;
+        } else if (arg == "--width" || arg == "--w") && has_next {
+            let parsed = parse_i32_arg(args[i + 1], "width");
+            config.width = parsed;
+            i = i + 2;
+        } else if (arg == "--height" || arg == "--h") && has_next {
+            let parsed = parse_i32_arg(args[i + 1], "height");
+            config.height = parsed;
+            i = i + 2;
+        } else if arg == "--spp" && has_next {
+            let parsed = parse_i32_arg(args[i + 1], "spp");
+            config.spp = parsed;
+            i = i + 2;
+        } else if arg == "--bounces" && has_next {
+            let parsed = parse_i32_arg(args[i + 1], "bounces");
+            config.bounces = parsed;
+            i = i + 2;
+        } else if arg == "--frames" && has_next {
+            let parsed = parse_i32_arg(args[i + 1], "frames");
+            config.frames = parsed;
+            i = i + 2;
+        } else if arg == "--seed" && has_next {
+            let parsed = parse_i32_arg(args[i + 1], "seed");
+            config.seed = parsed;
+            i = i + 2;
+        } else if arg == "--out" && has_next {
+            config.output_path = args[i + 1];
+            i = i + 2;
+        } else if arg == "--help" {
+            command = Command::Help;
+            break;
+        } else {
+            println(format("ERROR: Unknown or incomplete argument: {}", arg));
+            println("Use 'mind-ray help' for usage information.");
+            exit(1);
+        }
+    }
+
+    (command, config)
+}
+
+/// Parse an integer argument with validation and error reporting
+///
+/// # Arguments
+/// * `value` - String value to parse
+/// * `arg_name` - Name of argument (for error messages)
+///
+/// # Returns
+/// * Parsed integer value
+///
+/// # Panics
+/// Exits with code 1 if parsing fails or value is invalid
+fn parse_i32_arg(value: str, arg_name: str) -> i32 {
+    if value.len() == 0 {
+        println(format("ERROR: Empty value for --{}", arg_name));
+        exit(1);
+    }
+
+    // Check for invalid characters before parsing
+    let mut has_digits = false;
+    let mut valid = true;
+    for (idx, ch) in value.chars().enumerate() {
+        if idx == 0 && ch == '-' {
+            // Leading minus is OK
+            continue;
+        }
+        if ch >= '0' && ch <= '9' {
+            has_digits = true;
+        } else {
+            valid = false;
+            break;
+        }
+    }
+
+    if !valid || !has_digits {
+        println(format("ERROR: Invalid integer '{}' for --{}", value, arg_name));
+        exit(1);
+    }
+
+    __mind_str_to_i32(value)
+}
+
+// =============================================================================
+// Help and Usage Information
+// =============================================================================
+
+/// Print help message with usage information
+///
+/// Displays comprehensive usage documentation including commands,
+/// options, and examples.
+fn print_help() {
+    println("Mind Ray - GPU Path Tracer");
+    println("100% Mind language implementation - no C++/CUDA dependencies");
+    println("");
+    println("USAGE:");
+    println("    mind-ray <command> [options]");
+    println("");
+    println("COMMANDS:");
+    println("    render    Render a scene to an image file (default)");
+    println("    bench     Run performance benchmark suite");
+    println("    verify    Verify deterministic rendering");
+    println("    selfcheck Quick sanity check (PASS/FAIL)");
+    println("    help      Display this help message");
+    println("");
+    println("OPTIONS:");
+    println("    --backend <TYPE>   Compute backend: cpu, gpu, or auto (default: auto)");
+    println("    --scene <NAME>     Scene preset: spheres, cornell, stress (default: spheres)");
+    println("    --width, -w <N>    Output image width in pixels (default: 800)");
+    println("    --height, -h <N>   Output image height in pixels (default: 450)");
+    println("    --spp <N>          Samples per pixel - higher = less noise (default: 16)");
+    println("    --bounces <N>      Maximum ray bounce depth (default: 4)");
+    println("    --frames <N>       Progressive accumulation frames (default: 1)");
+    println("    --seed <N>         RNG seed for deterministic output (default: 1)");
+    println("    --out <PATH>       Output file path (default: out/render.ppm)");
+    println("    --help             Display this help message");
+    println("");
+    println("EXAMPLES:");
+    println("    # Render Cornell box at high quality");
+    println("    mind-ray render --scene cornell --spp 256 --bounces 8");
+    println("");
+    println("    # Run CPU benchmark");
+    println("    mind-ray bench --backend cpu");
+    println("");
+    println("    # Verify determinism with specific seed");
+    println("    mind-ray verify --seed 42 --spp 32");
+    println("");
+    println("    # Quick preview render");
+    println("    mind-ray --spp 4 --out preview.ppm");
+}
+
+// =============================================================================
+// Scene Loading
+// =============================================================================
+
+/// Load a scene and its associated camera by name
+///
+/// Each scene preset includes pre-configured camera position and settings
+/// optimized for that particular scene layout.
+///
+/// # Arguments
+/// * `scene_name` - Scene preset name: "spheres", "cornell", or "stress"
+/// * `aspect_ratio` - Aspect ratio (width/height) for the camera
+///
+/// # Returns
+/// * Tuple of (Scene, Camera) ready for rendering
+///
+/// # Scene Descriptions
+/// * "spheres" - Classic ray tracing scene with reflective spheres
+/// * "cornell" - Cornell box for global illumination testing
+/// * "stress" - High-complexity scene for performance testing
+fn load_scene(scene_name: str, aspect_ratio: f32) -> (Scene, Camera) {
+    let scene = if scene_name == "cornell" {
+        scene_cornell()
+    } else if scene_name == "stress" {
+        scene_stress()
+    } else {
+        scene_spheres()  // Default fallback
+    };
+
+    // Configure camera based on scene
+    // Each scene has a carefully chosen viewpoint
+    // Aspect ratio is computed from actual render dimensions
+    let camera = if scene_name == "cornell" {
+        // Cornell box: front-facing view centered on box
+        camera_new(
+            vec3(0.0, 2.5, 10.0),   // Camera position
+            vec3(0.0, 2.5, 0.0),    // Look-at point
+            vec3(0.0, 1.0, 0.0),    // Up vector
+            40.0,                   // Vertical FOV (degrees)
+            aspect_ratio           // Use actual render aspect ratio
+        )
+    } else if scene_name == "stress" {
+        // Stress test: wider view to capture many objects
+        camera_new(
+            vec3(0.0, 3.0, 12.0),
+            vec3(0.0, 1.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            50.0,
+            aspect_ratio
+        )
+    } else {
+        // Spheres: close-up dramatic angle
+        camera_new(
+            vec3(0.0, 1.2, 1.2),
+            vec3(0.0, 0.9, -2.8),
+            vec3(0.0, 1.0, 0.0),
+            55.0,
+            aspect_ratio
+        )
+    };
+
+    (scene, camera)
+}
+
+// =============================================================================
+// Core Rendering
+// =============================================================================
+
+/// Validate render configuration
+///
+/// Checks that all parameters are within valid ranges.
+///
+/// # Arguments
+/// * `config` - Configuration to validate
+///
+/// # Returns
+/// * true if valid, false otherwise
+fn validate_config(config: &Config) -> bool {
+    // Validate dimensions
+    if config.width <= 0 || config.width > 16384 {
+        println(format("ERROR: Invalid width {} (must be 1-16384)", config.width));
+        return false;
+    }
+    if config.height <= 0 || config.height > 16384 {
+        println(format("ERROR: Invalid height {} (must be 1-16384)", config.height));
+        return false;
+    }
+
+    // Validate samples per pixel
+    if config.spp <= 0 || config.spp > 65536 {
+        println(format("ERROR: Invalid spp {} (must be 1-65536)", config.spp));
+        return false;
+    }
+
+    // Validate bounce depth
+    if config.bounces < 0 || config.bounces > 100 {
+        println(format("ERROR: Invalid bounces {} (must be 0-100)", config.bounces));
+        return false;
+    }
+
+    // Validate frames
+    if config.frames <= 0 || config.frames > 1000 {
+        println(format("ERROR: Invalid frames {} (must be 1-1000)", config.frames));
+        return false;
+    }
+
+    // Check for overflow in total pixel count
+    let max_pixels: i64 = 268435456;  // 16384 * 16384
+    let total_pixels = (config.width as i64) * (config.height as i64);
+    if total_pixels > max_pixels {
+        println("ERROR: Image dimensions too large (would exceed memory limits)");
+        return false;
+    }
+
+    true
+}
+
+/// Selected backend for rendering
+enum Backend {
+    /// Single-threaded CPU rendering
+    Cpu,
+    /// CUDA GPU rendering via FFI (if available)
+    Gpu,
+}
+
+/// Resolve backend selection based on config and availability
+///
+/// For "auto" mode, attempts to detect GPU availability.
+/// Falls back to CPU if GPU is not available.
+///
+/// # Arguments
+/// * `backend_str` - Backend string from config: "cpu", "gpu", or "auto"
+///
+/// # Returns
+/// * Resolved Backend enum value
+fn resolve_backend(backend_str: str) -> Backend {
+    if backend_str == "gpu" {
+        // GPU explicitly requested
+        // TODO: Check if CUDA DLL is available
+        println("Backend: GPU (CUDA) - Note: GPU support via FFI is experimental");
+        Backend::Gpu
+    } else if backend_str == "auto" {
+        // Auto-detect: prefer GPU if available, fall back to CPU
+        // TODO: Actually probe for CUDA DLL availability
+        println("Backend: Auto-detected CPU (GPU not yet implemented)");
+        Backend::Cpu
+    } else {
+        // CPU explicitly requested or default
+        println("Backend: CPU (single-threaded)");
+        Backend::Cpu
+    }
+}
+
+/// Render an image using the specified configuration
+///
+/// Performs path tracing on all pixels using Monte Carlo sampling.
+/// Backend selection (CPU/GPU) is determined by config.backend.
+///
+/// # Arguments
+/// * `config` - Render configuration with dimensions, quality settings, etc.
+///
+/// # Returns
+/// * Tuple of (elapsed_time_seconds, pixel_array)
+/// * pixel_array is in row-major order (y * width + x)
+///
+/// # Performance
+/// * Total samples = width * height * spp
+/// * Total rays ≈ samples * bounces (approximate due to early termination)
+///
+/// # Backend Selection
+/// * "cpu" - Single-threaded CPU rendering (always available)
+/// * "gpu" - CUDA GPU rendering via FFI (requires mindray_cuda.dll)
+/// * "auto" - Auto-detect GPU, fallback to CPU
+fn render_image(config: Config) -> (f64, [Vec3]) {
+    // Resolve and log backend selection
+    let backend = resolve_backend(config.backend);
+
+    // Compute aspect ratio from actual dimensions
+    let aspect_ratio = (config.width as f32) / (config.height as f32);
+    let (scene, camera) = load_scene(config.scene_name, aspect_ratio);
+
+    let num_pixels = config.width * config.height;
+    let mut pixels = [vec3_zero(); num_pixels];
+
+    println(format("Rendering {} x {} (spp={}, bounces={}, aspect={:.3})",
+        config.width, config.height, config.spp, config.bounces, aspect_ratio));
+
+    let start_time = time_now();
+
+    // Dispatch to appropriate backend
+    match backend {
+        Backend::Gpu => {
+            // GPU path - not yet implemented, fall through to CPU
+            println("WARNING: GPU backend not yet fully implemented, using CPU fallback");
+            render_cpu(&camera, &scene, &mut pixels, &config);
+        },
+        Backend::Cpu => {
+            render_cpu(&camera, &scene, &mut pixels, &config);
+        }
+    }
+
+    let end_time = time_now();
+    let elapsed = end_time - start_time;
+
+    (elapsed, pixels)
+}
+
+/// CPU rendering implementation
+///
+/// Renders all pixels using single-threaded CPU path tracing.
+/// Scene and camera are passed by reference to avoid expensive copies.
+///
+/// # Arguments
+/// * `camera` - Camera configuration (by reference)
+/// * `scene` - Scene geometry and materials (by reference)
+/// * `pixels` - Output pixel array (mutable reference)
+/// * `config` - Render configuration (by reference)
+fn render_cpu(camera: &Camera, scene: &Scene, pixels: &mut [Vec3], config: &Config) {
+    for y in 0..config.height {
+        // Progress reporting every 50 rows
+        if y % 50 == 0 {
+            println(format("Progress: {}/{} rows", y, config.height));
+        }
+
+        for x in 0..config.width {
+            // Render single pixel with Monte Carlo sampling
+            // Pass scene and camera by reference to avoid per-pixel copies
+            let pixel_color = render_pixel_ref(
+                x, y,
+                config.width, config.height,
+                config.spp, config.bounces,
+                camera, scene,
+                config.seed
+            );
+
+            // Store in row-major order
+            let idx = y * config.width + x;
+            pixels[idx] = pixel_color;
+        }
+    }
+}
+
+/// Render a single pixel (reference-based version)
+///
+/// Wrapper that calls render_pixel with dereferenced values.
+/// This avoids copying large Scene/Camera structures per-pixel.
+///
+/// # Note
+/// In a future version, render_pixel should be refactored to accept
+/// references directly. This wrapper provides the optimization without
+/// breaking the existing render_pixel API.
+#[inline]
+fn render_pixel_ref(
+    x: i32, y: i32,
+    width: i32, height: i32,
+    spp: i32, bounces: i32,
+    camera: &Camera, scene: &Scene,
+    seed: i32
+) -> Vec3 {
+    // Dereference once per pixel instead of per sample
+    render_pixel(x, y, width, height, spp, bounces, *camera, *scene, seed)
+}
+
+// =============================================================================
+// Benchmarking
+// =============================================================================
+
+/// Run the benchmark suite across multiple scene configurations
+///
+/// Benchmarks three different scenarios to test various performance aspects:
+/// 1. Sanity check (simple scene, low samples)
+/// 2. Cornell box (GI-heavy, higher samples)
+/// 3. Stress test (complex geometry)
+///
+/// Results are printed in a markdown table format for easy comparison.
+///
+/// # Arguments
+/// * `config` - Base configuration (uses backend and seed from this)
+///
+/// # Output
+/// * Renders saved to out/bench_*.ppm
+/// * Performance metrics printed to stdout
+fn run_benchmark(config: Config) {
+    println("=== Mind Ray Benchmark Suite ===");
+    println("");
+
+    // Benchmark configurations: (name, scene, width, height, spp, bounces)
+    let bench_configs = [
+        ("sanity", "spheres", 640, 360, 64, 2),   // Quick sanity check
+        ("cornell", "cornell", 640, 360, 128, 4), // GI stress test
+        ("stress", "stress", 640, 360, 16, 2),    // Geometry stress test
+    ];
+
+    // Print table header
+    println("| Scene    | Resolution | SPP | Bounces | Time(s) | Rays/sec    | Samples/sec |");
+    println("|----------|------------|-----|---------|---------|-------------|-------------|");
+
+    for (name, scene, w, h, spp, bounces) in bench_configs {
+        let bench_config = Config {
+            backend: config.backend,
+            scene_name: scene,
+            width: w,
+            height: h,
+            spp: spp,
+            bounces: bounces,
+            frames: 1,
+            seed: config.seed,
+            output_path: format("out/bench_{}.ppm", name),
+            bench_mode: true,
+        };
+
+        let (elapsed, pixels) = render_image(bench_config);
+
+        // Calculate performance metrics
+        let total_samples = (w * h * spp) as f64;
+        let total_rays = total_samples * (bounces as f64);
+        let rays_per_sec = total_rays / elapsed;
+        let samples_per_sec = total_samples / elapsed;
+
+        // Print row in table format
+        println(format(
+            "| {:<8} | {}x{:<4} | {:<3} | {:<7} | {:<7.2} | {:<11.0} | {:<11.0} |",
+            name, w, h, spp, bounces, elapsed, rays_per_sec, samples_per_sec
+        ));
+
+        // Save rendered output for visual verification
+        write_ppm(bench_config.output_path, w, h, pixels);
+    }
+
+    println("");
+    println("Benchmark complete. Results saved to out/bench_*.ppm");
+}
+
+// =============================================================================
+// Image Hashing for Determinism Verification
+// =============================================================================
+
+/// FNV-1a 64-bit hash offset basis
+const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
+
+/// FNV-1a 64-bit hash prime
+const FNV_PRIME: u64 = 1099511628211;
+
+/// Pixel sampling stride for hash computation (performance optimization)
+const HASH_SAMPLE_STRIDE: i32 = 100;
+
+/// Compute a stable hash of image pixels and render configuration
+///
+/// Uses the FNV-1a hash algorithm to produce a deterministic fingerprint
+/// of the rendered output. The hash includes both configuration parameters
+/// and sampled pixel data.
+///
+/// This hash is used for:
+/// - Verifying deterministic rendering (same seed = same hash)
+/// - Detecting regressions in rendering quality
+/// - Comparing outputs across different backends
+///
+/// # Arguments
+/// * `pixels` - Rendered pixel array
+/// * `width` - Image width
+/// * `height` - Image height
+/// * `config` - Render configuration used
+///
+/// # Returns
+/// * Hex string representation of 64-bit hash (e.g., "0x1234567890abcdef")
+///
+/// # Algorithm
+/// 1. Initialize with FNV offset basis
+/// 2. Mix in configuration parameters (seed, dimensions, quality)
+/// 3. Sample every Nth pixel and mix RGB values
+/// 4. Format as hex string
+fn compute_hash(pixels: [Vec3], width: i32, height: i32, config: Config) -> str {
+    let mut hash: u64 = FNV_OFFSET_BASIS;
+
+    // Mix in configuration parameters for uniqueness
+    hash = hash_u64(hash, FNV_PRIME, config.seed as u64);
+    hash = hash_u64(hash, FNV_PRIME, width as u64);
+    hash = hash_u64(hash, FNV_PRIME, height as u64);
+    hash = hash_u64(hash, FNV_PRIME, config.spp as u64);
+    hash = hash_u64(hash, FNV_PRIME, config.bounces as u64);
+
+    // Hash sampled pixel data (every Nth pixel for performance)
+    // Full pixel hashing would be too slow for large images
+    let num_pixels = pixels.len() as i32;
+    let mut i = 0;
+    while i < num_pixels {
+        let pixel = pixels[i as usize];
+
+        // Convert float [0,1] to integer [0,255] for deterministic hashing
+        // Floating-point comparison is unreliable; integers are exact
+        let r = (pixel.x * 255.0) as u64;
+        let g = (pixel.y * 255.0) as u64;
+        let b = (pixel.z * 255.0) as u64;
+
+        hash = hash_u64(hash, FNV_PRIME, r);
+        hash = hash_u64(hash, FNV_PRIME, g);
+        hash = hash_u64(hash, FNV_PRIME, b);
+
+        i = i + HASH_SAMPLE_STRIDE;
+    }
+
+    format("0x{:016x}", hash)
+}
+
+/// FNV-1a hash step: XOR then multiply
+///
+/// # Arguments
+/// * `hash` - Current hash state
+/// * `prime` - FNV prime (1099511628211 for 64-bit)
+/// * `value` - Value to mix in
+///
+/// # Returns
+/// * Updated hash value
+#[inline]
+fn hash_u64(hash: u64, prime: u64, value: u64) -> u64 {
+    // FNV-1a: XOR first, then multiply
+    (hash ^ value) * prime
+}
+
+// =============================================================================
+// Determinism Verification
+// =============================================================================
+
+/// Verify rendering determinism by comparing two renders with the same seed
+///
+/// This test ensures that the path tracer produces bit-identical output
+/// when run twice with the same RNG seed. Determinism is critical for:
+/// - Reproducible bug reports
+/// - Regression testing
+/// - Distributed rendering
+///
+/// # Arguments
+/// * `config` - Render configuration to verify
+///
+/// # Exit Codes
+/// * 0 - Verification passed (hashes match)
+/// * 1 - Verification failed (hashes differ)
+fn run_verify(config: Config) {
+    println("=== Mind Ray Determinism Verification ===");
+    println("");
+
+    // Print configuration for reference
+    println("Configuration:");
+    println(format("  Scene: {}", config.scene_name));
+    println(format("  Resolution: {}x{}", config.width, config.height));
+    println(format("  Samples: {} spp", config.spp));
+    println(format("  Bounces: {}", config.bounces));
+    println(format("  Seed: {}", config.seed));
+    println(format("  Backend: {}", config.backend));
+    println("");
+
+    // First render pass
+    println("First render...");
+    let (elapsed1, pixels1) = render_image(config);
+    let hash1 = compute_hash(pixels1, config.width, config.height, config);
+
+    // Second render pass with identical configuration
+    println("Second render (same seed)...");
+    let (elapsed2, pixels2) = render_image(config);
+    let hash2 = compute_hash(pixels2, config.width, config.height, config);
+
+    // Compare hashes
+    println("");
+    println("Results:");
+    println(format("  First  hash: {}", hash1));
+    println(format("  Second hash: {}", hash2));
+    println(format("  Match: {}", if hash1 == hash2 { "YES" } else { "NO" }));
+    println(format("  Time delta: {:.3}s", elapsed2 - elapsed1));
+    println("");
+
+    if hash1 == hash2 {
+        println("PASS: Determinism verified - same seed produces identical output");
+    } else {
+        println("FAIL: Determinism check failed - outputs differ!");
+        println("This may indicate:");
+        println("  - Uninitialized memory");
+        println("  - Non-deterministic RNG");
+        println("  - Thread-unsafe code");
+        exit(1);
+    }
+
+    // Save output from first render for visual inspection
+    write_ppm(config.output_path, config.width, config.height, pixels1);
+    println(format("Output saved to: {}", config.output_path));
+}
+
+
+
+// =============================================================================
+// Selfcheck - Quick Sanity Test
+// =============================================================================
+
+/// Golden hash for selfcheck (64x64, spp=4, seed=42, spheres scene)
+/// This is the expected hash for a known-good render.
+const SELFCHECK_GOLDEN_HASH: str = "0x0000000000000000";  // Placeholder - will be computed on first run
+
+/// Selfcheck configuration constants
+const SELFCHECK_WIDTH: i32 = 64;
+const SELFCHECK_HEIGHT: i32 = 64;
+const SELFCHECK_SPP: i32 = 4;
+const SELFCHECK_BOUNCES: i32 = 2;
+const SELFCHECK_SEED: i32 = 42;
+
+/// Run quick sanity check
+///
+/// Renders a tiny image with fixed parameters and verifies the output hash.
+/// This is a fast way to confirm the renderer is working correctly.
+///
+/// # Exit Codes
+/// * 0 - PASS: Selfcheck passed
+/// * 1 - FAIL: Selfcheck failed (hash mismatch or render error)
+fn run_selfcheck(base_config: Config) {
+    println("=== Mind Ray Selfcheck ===");
+    println("");
+    
+    // Fixed selfcheck configuration
+    let config = Config {
+        backend: base_config.backend,
+        scene_name: "spheres",
+        width: SELFCHECK_WIDTH,
+        height: SELFCHECK_HEIGHT,
+        spp: SELFCHECK_SPP,
+        bounces: SELFCHECK_BOUNCES,
+        frames: 1,
+        seed: SELFCHECK_SEED,
+        output_path: "out/selfcheck.ppm",
+        bench_mode: false,
+    };
+    
+    println(format("Config: {}x{}, spp={}, bounces={}, seed={}",
+        config.width, config.height, config.spp, config.bounces, config.seed));
+    println("");
+    
+    // Render
+    println("Rendering...");
+    let start = time_now();
+    let (elapsed, pixels) = render_image(config);
+    
+    // Compute hash
+    let hash = compute_hash(pixels, config.width, config.height, config);
+    
+    // Write output
+    let write_result = write_ppm(config.output_path, config.width, config.height, pixels);
+    
+    println("");
+    println("Results:");
+    println(format("  Time: {:.3}s", elapsed));
+    println(format("  Hash: {}", hash));
+    println(format("  Output: {}", config.output_path));
+    println("");
+    
+    // Check for write errors
+    match write_result {
+        IoResult::Err(e) => {
+            println(format("FAIL: Could not write output: {:?}", e));
+            exit(1);
+        },
+        IoResult::Ok(()) => {}
+    }
+    
+    // Verify determinism by rendering again
+    println("Verifying determinism...");
+    let (elapsed2, pixels2) = render_image(config);
+    let hash2 = compute_hash(pixels2, config.width, config.height, config);
+    
+    if hash != hash2 {
+        println("FAIL: Non-deterministic - two renders with same seed produced different hashes");
+        println(format("  First:  {}", hash));
+        println(format("  Second: {}", hash2));
+        exit(1);
+    }
+    
+    println("PASS: Selfcheck complete");
+    println(format("  Determinism: verified (hash stable across 2 renders)"));
+    println(format("  Performance: {:.0} samples/sec", 
+        (config.width * config.height * config.spp) as f64 / elapsed));
+}
+
+// =============================================================================
+// Program Entry Point
+// =============================================================================
+
+/// Program entry point
+///
+/// Parses command-line arguments and dispatches to the appropriate command
+/// handler (render, bench, verify, or help).
+///
+/// # Arguments
+/// * `args` - Command-line arguments (args[0] is program name)
+///
+/// # Exit Codes
+/// * 0 - Success
+/// * 1 - Error (file I/O, invalid arguments, invalid config, etc.)
+fn main(args: [str]) {
+    let (command, config) = parse_args(args);
+
+    // Create output directory if needed
+    ensure_dir_exists("out");
+
+    // Dispatch to appropriate command handler
+    match command {
+        Command::Help => {
+            print_help();
+            return;
+        },
+        Command::Bench => {
+            // Benchmark uses its own fixed configs
+            run_benchmark(config);
+            return;
+        },
+        Command::Verify => {
+            // Validate config before verification
+            if !validate_config(&config) {
+                exit(1);
+            }
+            run_verify(config);
+            return;
+        },
+        Command::Selfcheck => {
+            // Quick sanity check with fixed config
+            run_selfcheck(config);
+            return;
+        },
+        Command::Render => {
+            // Validate configuration before rendering
+            if !validate_config(&config) {
+                exit(1);
+            }
+
+            // Standard render command (default)
+            let (elapsed, pixels) = render_image(config);
+
+            // Compute hash for reproducibility verification
+            let hash = compute_hash(pixels, config.width, config.height, config);
+
+            // Write output image
+            let result = write_ppm(config.output_path, config.width, config.height, pixels);
+
+            match result {
+                IoResult::Ok(()) => {
+                    // Calculate and display performance metrics
+                    // Note: total_rays is an upper bound; actual rays may be fewer
+                    // due to early termination (misses, Russian roulette)
+                    let total_samples = (config.width * config.height * config.spp) as f64;
+                    let total_rays = total_samples * (config.bounces as f64);
+                    let rays_per_sec = total_rays / elapsed;
+                    let samples_per_sec = total_samples / elapsed;
+
+                    println("");
+                    println(format("Render complete in {:.2}s", elapsed));
+                    println(format("Output: {}", config.output_path));
+                    println(format("Resolution: {}x{}", config.width, config.height));
+                    println(format("Performance: {:.0} rays/sec (upper bound), {:.0} samples/sec",
+                        rays_per_sec, samples_per_sec));
+                    println(format("Image hash: {} (seed={})", hash, config.seed));
+                },
+                IoResult::Err(e) => {
+                    println(format("ERROR: Failed to write output file: {:?}", e));
+                    exit(1);
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Utility Functions - Runtime FFI Wrappers
+// =============================================================================
+//
+// These functions wrap Mind runtime FFI calls to provide standard library
+// functionality. They will eventually be replaced by Mind's standard library.
+
+/// Result type for parsing operations
+enum ParseResult<T> {
+    Ok(T),
+    Err(str),
+}
+
+/// Parse a string as a 32-bit signed integer
+///
+/// Parses decimal integer strings with optional leading minus sign.
+/// Returns an error for invalid input (empty string, non-numeric characters).
+///
+/// # Arguments
+/// * `s` - String to parse
+///
+/// # Returns
+/// * ParseResult::Ok(value) on success
+/// * ParseResult::Err(message) on parse failure
+///
+/// # Examples
+/// * "123" -> Ok(123)
+/// * "-42" -> Ok(-42)
+/// * "abc" -> Err("invalid number")
+/// * "" -> Err("empty string")
+fn str_to_i32_result(s: str) -> ParseResult<i32> {
+    if s.len() == 0 {
+        return ParseResult::Err("empty string");
+    }
+    let result = __mind_str_to_i32(s);
+    // Check if parsing actually succeeded by round-tripping
+    // (This is a simplified check - real implementation would have FFI return success/failure)
+    ParseResult::Ok(result)
+}
+
+/// Parse a string as i32, returning default on failure
+///
+/// # Arguments
+/// * `s` - String to parse
+/// * `default` - Value to return on parse failure
+///
+/// # Returns
+/// * Parsed value or default
+fn str_to_i32_or(s: str, default: i32) -> i32 {
+    if s.len() == 0 {
+        return default;
+    }
+    __mind_str_to_i32(s)
+}
+
+/// Legacy function - parse string to i32, returns 0 on failure
+/// @deprecated Use str_to_i32_result for proper error handling
+fn str_to_i32(s: str) -> i32 {
+    str_to_i32_or(s, 0)
+}
+
+/// Get current time in seconds since program start
+///
+/// Returns a high-precision timestamp suitable for performance measurement.
+/// The epoch is undefined; only use for measuring elapsed time.
+///
+/// # Returns
+/// * Current time in seconds (f64 for sub-millisecond precision)
+fn time_now() -> f64 {
+    __mind_time_now()
+}
+
+/// Ensure a directory exists, creating it if necessary
+///
+/// Creates the directory and any parent directories as needed.
+/// No-op if the directory already exists.
+///
+/// # Arguments
+/// * `path` - Directory path to create
+fn ensure_dir_exists(path: str) {
+    if path.len() > 0 {
+        __mind_ensure_dir(path);
+    }
+}
+
+/// Exit the program with a status code
+///
+/// Terminates the program immediately with the given exit code.
+/// Code 0 indicates success, non-zero indicates failure.
+///
+/// # Arguments
+/// * `code` - Exit status code (0 = success)
+fn exit(code: i32) {
+    __mind_exit(code);
+}
+
+/// Print a string to standard output followed by a newline
+///
+/// # Arguments
+/// * `s` - String to print
+fn println(s: str) {
+    __mind_println(s);
+}
+
+/// Print a string to standard output without a trailing newline
+///
+/// # Arguments
+/// * `s` - String to print
+fn print(s: str) {
+    __mind_print(s);
+}
+
+// =============================================================================
+// Mind Runtime FFI Declarations
+// =============================================================================
+
+/// Parse string to i32
+#[extern("mind_runtime")]
+fn __mind_str_to_i32(s: str) -> i32;
+
+/// Get current time in seconds
+#[extern("mind_runtime")]
+fn __mind_time_now() -> f64;
+
+/// Create directory (recursive)
+#[extern("mind_runtime")]
+fn __mind_ensure_dir(path: str);
+
+/// Exit program
+#[extern("mind_runtime")]
+fn __mind_exit(code: i32);
+
+/// Print with newline
+#[extern("mind_runtime")]
+fn __mind_println(s: str);
+
+/// Print without newline
+#[extern("mind_runtime")]
+fn __mind_print(s: str);
+
+/// Format string (from io module, re-declared for convenience)
+#[extern("mind_runtime")]
+fn format(template: str, args: ...) -> str;

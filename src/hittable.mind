@@ -1,0 +1,360 @@
+// hittable.mind - Geometry Primitives and Ray Intersection
+//
+// This module provides the geometric primitives for the path tracer:
+// - Spheres: Implicit surface defined by center and radius
+// - Rectangles: Axis-aligned rectangles for box construction
+// - Planes: Infinite planes for floors and backgrounds
+//
+// All intersection functions return a HitRecord containing:
+// - Hit point and surface normal
+// - Distance along ray (t parameter)
+// - Front/back face determination
+// - Material index for shading
+//
+// The intersection algorithms use analytical solutions for efficiency.
+// All primitives support the same interface for polymorphic scene traversal.
+//
+// Author: Mind Ray Contributors
+// License: MIT
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Epsilon for parallel ray detection in plane/rect intersection
+const PARALLEL_EPSILON: f32 = 0.0001;
+
+/// Default t value for miss (very large positive number)
+const T_MISS: f32 = 1000000.0;
+
+/// Minimum valid radius for spheres (prevents division issues)
+const MIN_RADIUS: f32 = 0.0001;
+
+/// Minimum valid direction length squared (prevents division by zero)
+const MIN_DIR_LEN_SQ: f32 = 0.0000001;
+
+// =============================================================================
+// Hit Record
+// =============================================================================
+
+/// Result of a ray-primitive intersection test
+///
+/// Contains all information needed for shading at the hit point.
+/// If did_hit is false, other fields are undefined.
+pub struct HitRecord {
+    /// World-space position of the hit point
+    point: Vec3,
+    /// Surface normal at hit point (always points outward from surface)
+    normal: Vec3,
+    /// Distance along ray: hit_point = ray.origin + t * ray.direction
+    t: f32,
+    /// True if ray hit the front face (normal points toward ray origin)
+    front_face: bool,
+    /// Index into scene's material array for shading
+    material_idx: i32,
+    /// Whether an intersection was found
+    did_hit: bool,
+}
+
+/// Create a "miss" hit record (no intersection found)
+///
+/// # Returns
+/// * HitRecord with did_hit=false and default values
+#[inline]
+pub fn hit_record_none() -> HitRecord {
+    HitRecord {
+        point: vec3_zero(),
+        normal: vec3(0.0, 1.0, 0.0),
+        t: T_MISS,
+        front_face: true,
+        material_idx: 0,
+        did_hit: false,
+    }
+}
+
+// =============================================================================
+// Sphere Primitive
+// =============================================================================
+
+/// Sphere defined by center point and radius
+///
+/// The most common primitive in ray tracing due to its simple analytical
+/// intersection formula. Implicit equation: |P - C|^2 = r^2
+pub struct Sphere {
+    /// Center point in world space
+    center: Vec3,
+    /// Radius (must be positive)
+    radius: f32,
+    /// Index into scene's material array
+    material_idx: i32,
+}
+
+/// Test ray-sphere intersection
+///
+/// Uses the quadratic formula to find intersection points.
+/// Returns the nearest intersection within [t_min, t_max].
+///
+/// # Arguments
+/// * `sphere` - Sphere to test
+/// * `r` - Ray to test
+/// * `t_min` - Minimum valid t (prevents self-intersection)
+/// * `t_max` - Maximum valid t (for shadow rays and closest hit)
+///
+/// # Returns
+/// * HitRecord with intersection data, or miss record if no hit
+///
+/// # Algorithm
+/// 1. Substitute ray equation into sphere equation
+/// 2. Solve quadratic: at^2 + bt + c = 0
+/// 3. Check discriminant for real roots
+/// 4. Return nearest root in valid range
+pub fn hit_sphere(
+    sphere: Sphere,
+    r: Ray,
+    t_min: f32,
+    t_max: f32
+) -> HitRecord {
+    // Validate sphere radius (must be positive)
+    if sphere.radius < MIN_RADIUS {
+        return hit_record_none();
+    }
+
+    // Vector from ray origin to sphere center
+    let oc = v3_sub(r.origin, sphere.center);
+
+    // Quadratic coefficients (half_b optimization: b/2 instead of b)
+    let a = v3_length_sq(r.direction);
+
+    // Validate ray direction (must be non-zero)
+    if a < MIN_DIR_LEN_SQ {
+        return hit_record_none();
+    }
+
+    let half_b = v3_dot(oc, r.direction);
+    let c = v3_length_sq(oc) - sphere.radius * sphere.radius;
+
+    // Discriminant determines if real solutions exist
+    let discriminant = half_b * half_b - a * c;
+
+    if discriminant < 0.0 {
+        return hit_record_none();
+    }
+
+    let sqrtd = f32_sqrt(discriminant);
+
+    // Find nearest root in valid range
+    // Try the closer root first (- sqrt), then the farther (+ sqrt)
+    let mut root = (-half_b - sqrtd) / a;
+    if root < t_min || root > t_max {
+        root = (-half_b + sqrtd) / a;
+        if root < t_min || root > t_max {
+            return hit_record_none();
+        }
+    }
+
+    let hit_point = ray_at(r, root);
+
+    // Normal points outward from center, normalized by dividing by radius
+    let outward_normal = v3_div(v3_sub(hit_point, sphere.center), sphere.radius);
+
+    // Determine if we hit front or back face
+    let front_face = v3_dot(r.direction, outward_normal) < 0.0;
+    let normal = if front_face { outward_normal } else { v3_neg(outward_normal) };
+
+    HitRecord {
+        point: hit_point,
+        normal: normal,
+        t: root,
+        front_face: front_face,
+        material_idx: sphere.material_idx,
+        did_hit: true,
+    }
+}
+
+// =============================================================================
+// Axis-Aligned Rectangle Primitive
+// =============================================================================
+
+/// Axis-aligned rectangle for box construction
+///
+/// A finite rectangle aligned to one of the coordinate planes.
+/// Used to build Cornell box walls and area lights.
+///
+/// # Axis Encoding
+/// - axis=0: YZ plane (x = k), rectangle spans [x0,x1] x [y0,y1] in YZ
+/// - axis=1: XZ plane (y = k), rectangle spans [x0,x1] x [y0,y1] in XZ
+/// - axis=2: XY plane (z = k), rectangle spans [x0,x1] x [y0,y1] in XY
+pub struct Rect {
+    /// Minimum U coordinate (first varying axis)
+    x0: f32,
+    /// Maximum U coordinate
+    x1: f32,
+    /// Minimum V coordinate (second varying axis)
+    y0: f32,
+    /// Maximum V coordinate
+    y1: f32,
+    /// Constant coordinate value along the fixed axis
+    k: f32,
+    /// Axis encoding: 0=YZ plane, 1=XZ plane, 2=XY plane
+    axis: i32,
+    /// Index into scene's material array
+    material_idx: i32,
+}
+
+/// Test ray-rectangle intersection
+///
+/// Finds intersection with an axis-aligned rectangle. First computes
+/// the t value where the ray hits the plane, then checks if the hit
+/// point lies within the rectangle bounds.
+///
+/// # Arguments
+/// * `rect` - Rectangle to test
+/// * `r` - Ray to test
+/// * `t_min` - Minimum valid t
+/// * `t_max` - Maximum valid t
+///
+/// # Returns
+/// * HitRecord with intersection data, or miss record if no hit
+pub fn hit_rect(
+    rect: Rect,
+    r: Ray,
+    t_min: f32,
+    t_max: f32
+) -> HitRecord {
+    // Validate axis is in valid range [0, 2]
+    if rect.axis < 0 || rect.axis > 2 {
+        return hit_record_none();
+    }
+
+    // Extract ray components based on which axis is constant
+    let (const_comp, u_comp, v_comp, const_dir, u_dir, v_dir) = if rect.axis == 0 {
+        // YZ plane (x = k): test against x, compute y and z
+        (r.origin.x, r.origin.y, r.origin.z, r.direction.x, r.direction.y, r.direction.z)
+    } else if rect.axis == 1 {
+        // XZ plane (y = k): test against y, compute x and z
+        (r.origin.y, r.origin.x, r.origin.z, r.direction.y, r.direction.x, r.direction.z)
+    } else {
+        // XY plane (z = k): test against z, compute x and y
+        (r.origin.z, r.origin.x, r.origin.y, r.direction.z, r.direction.x, r.direction.y)
+    };
+
+    // Check if ray is parallel to the plane
+    if f32_abs(const_dir) < PARALLEL_EPSILON {
+        return hit_record_none();
+    }
+
+    // Compute t where ray intersects the plane
+    let t = (rect.k - const_comp) / const_dir;
+
+    if t < t_min || t > t_max {
+        return hit_record_none();
+    }
+
+    // Compute UV coordinates at the hit point
+    let u = u_comp + t * u_dir;
+    let v = v_comp + t * v_dir;
+
+    // Check if hit point is within rectangle bounds
+    if u < rect.x0 || u > rect.x1 || v < rect.y0 || v > rect.y1 {
+        return hit_record_none();
+    }
+
+    let hit_point = ray_at(r, t);
+
+    // Normal is along the constant axis
+    let outward_normal = if rect.axis == 0 {
+        vec3(1.0, 0.0, 0.0)
+    } else if rect.axis == 1 {
+        vec3(0.0, 1.0, 0.0)
+    } else {
+        vec3(0.0, 0.0, 1.0)
+    };
+
+    let front_face = v3_dot(r.direction, outward_normal) < 0.0;
+    let normal = if front_face { outward_normal } else { v3_neg(outward_normal) };
+
+    HitRecord {
+        point: hit_point,
+        normal: normal,
+        t: t,
+        front_face: front_face,
+        material_idx: rect.material_idx,
+        did_hit: true,
+    }
+}
+
+// =============================================================================
+// Infinite Plane Primitive
+// =============================================================================
+
+/// Infinite plane defined by normal and distance from origin
+///
+/// The plane equation is: dot(normal, P) + distance = 0
+/// Commonly used for ground planes and infinite backgrounds.
+///
+/// # Plane Equation
+/// For a plane with normal N and distance d:
+/// - All points P on the plane satisfy: N.P + d = 0
+/// - The signed distance from origin is -d (if N is unit length)
+pub struct Plane {
+    /// Surface normal (should be unit length)
+    normal: Vec3,
+    /// Signed distance from origin (negative if origin is on positive side)
+    distance: f32,
+    /// Index into scene's material array
+    material_idx: i32,
+}
+
+/// Test ray-plane intersection
+///
+/// Computes intersection using the parametric ray equation substituted
+/// into the plane equation.
+///
+/// # Arguments
+/// * `plane` - Plane to test
+/// * `r` - Ray to test
+/// * `t_min` - Minimum valid t
+/// * `t_max` - Maximum valid t
+///
+/// # Returns
+/// * HitRecord with intersection data, or miss record if no hit
+///
+/// # Algorithm
+/// Solve: dot(normal, origin + t*direction) + distance = 0
+/// Gives: t = -(dot(normal, origin) + distance) / dot(normal, direction)
+pub fn hit_plane(
+    plane: Plane,
+    r: Ray,
+    t_min: f32,
+    t_max: f32
+) -> HitRecord {
+    // Denominator: dot(normal, direction)
+    // If near zero, ray is parallel to plane
+    let denom = v3_dot(plane.normal, r.direction);
+
+    if f32_abs(denom) < PARALLEL_EPSILON {
+        return hit_record_none();
+    }
+
+    // Solve for t
+    let t = -(v3_dot(plane.normal, r.origin) + plane.distance) / denom;
+
+    if t < t_min || t > t_max {
+        return hit_record_none();
+    }
+
+    let hit_point = ray_at(r, t);
+
+    // Front face if ray approaches from the direction of the normal
+    let front_face = denom < 0.0;
+    let normal = if front_face { plane.normal } else { v3_neg(plane.normal) };
+
+    HitRecord {
+        point: hit_point,
+        normal: normal,
+        t: t,
+        front_face: front_face,
+        material_idx: plane.material_idx,
+        did_hit: true,
+    }
+}

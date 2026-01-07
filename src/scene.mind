@@ -1,0 +1,421 @@
+// scene.mind - Scene Definitions for Mind Ray Path Tracer
+//
+// This module defines scene data structures and provides preset scene
+// configurations for rendering. Each scene includes geometry (spheres,
+// rectangles, planes) and associated materials.
+//
+// Available Presets:
+// - spheres: Classic ray tracing scene with reflective spheres on a ground plane
+// - cornell: Cornell box for global illumination testing
+// - stress: High-complexity grid of 64 spheres for performance benchmarking
+//
+// Memory Layout:
+// All scene data uses fixed-size arrays for GPU compatibility. The max
+// capacity limits are chosen to fit in GPU constant memory while allowing
+// complex scenes. Total scene size: ~8KB with default limits.
+//
+// Thread Safety:
+// Scene structs are immutable after construction and can be safely shared
+// across render threads. The scene_hit function is pure (no side effects).
+//
+// GPU Compatibility:
+// The fixed-size array design allows direct memcpy to GPU constant memory.
+// Material indices (i32) reference into the materials array, enabling
+// polymorphic materials without GPU-unfriendly virtual dispatch.
+//
+// Coordinate System:
+// Right-handed coordinate system with Y-up:
+// - +X: Right
+// - +Y: Up
+// - +Z: Toward camera (out of screen)
+//
+// Author: Mind Ray Contributors
+// License: MIT
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Maximum number of spheres in a scene
+pub const MAX_SPHERES: usize = 64;
+
+/// Maximum number of axis-aligned rectangles
+pub const MAX_RECTS: usize = 16;
+
+/// Maximum number of infinite planes
+pub const MAX_PLANES: usize = 4;
+
+/// Maximum number of unique materials
+pub const MAX_MATERIALS: usize = 32;
+
+/// Minimum ray hit distance (prevents self-intersection)
+const RAY_T_MIN: f32 = 0.001;
+
+/// Maximum ray travel distance
+const RAY_T_MAX: f32 = 1000000.0;
+
+// =============================================================================
+// Scene Data Structure
+// =============================================================================
+
+/// Complete scene representation containing geometry and materials
+///
+/// All arrays are fixed-size for GPU constant memory compatibility.
+/// Use num_* fields to determine actual element counts.
+///
+/// # Fields
+/// * `spheres` - Array of sphere primitives (up to MAX_SPHERES)
+/// * `num_spheres` - Actual number of spheres in the scene
+/// * `rects` - Array of axis-aligned rectangles (up to MAX_RECTS)
+/// * `num_rects` - Actual number of rectangles
+/// * `planes` - Array of infinite planes (up to MAX_PLANES)
+/// * `num_planes` - Actual number of planes
+/// * `materials` - Material library (up to MAX_MATERIALS)
+/// * `num_materials` - Actual number of materials
+/// * `background` - Background color (used when rays escape scene)
+pub struct Scene {
+    /// Sphere primitives (fixed-size for GPU compatibility)
+    spheres: [Sphere; MAX_SPHERES],
+    /// Number of active spheres (0 to MAX_SPHERES)
+    num_spheres: usize,
+    /// Axis-aligned rectangle primitives
+    rects: [Rect; MAX_RECTS],
+    /// Number of active rectangles
+    num_rects: usize,
+    /// Infinite plane primitives
+    planes: [Plane; MAX_PLANES],
+    /// Number of active planes
+    num_planes: usize,
+    /// Material library indexed by geometry
+    materials: [Material; MAX_MATERIALS],
+    /// Number of defined materials
+    num_materials: usize,
+    /// Background/sky color for escaped rays
+    background: Vec3,
+}
+
+// =============================================================================
+// Scene Construction
+// =============================================================================
+
+/// Create an empty scene with default initialization
+///
+/// Allocates fixed-size arrays with zero elements active.
+/// Use as starting point for building custom scenes.
+///
+/// # Returns
+/// * Scene with all counts set to 0 and neutral background color
+fn scene_empty() -> Scene {
+    Scene {
+        spheres: [Sphere { center: vec3_zero(), radius: 0.0, material_idx: 0 }; MAX_SPHERES],
+        num_spheres: 0,
+        rects: [Rect { x0: 0.0, x1: 0.0, y0: 0.0, y1: 0.0, k: 0.0, axis: 0, material_idx: 0 }; MAX_RECTS],
+        num_rects: 0,
+        planes: [Plane { normal: vec3(0.0, 1.0, 0.0), distance: 0.0, material_idx: 0 }; MAX_PLANES],
+        num_planes: 0,
+        materials: [Material::Diffuse(MaterialDiffuse { albedo: vec3(0.5, 0.5, 0.5) }); MAX_MATERIALS],
+        num_materials: 0,
+        background: vec3(0.7, 0.8, 1.0),
+    }
+}
+
+// =============================================================================
+// Preset Scenes
+// =============================================================================
+
+/// Create the "spheres" preset scene
+///
+/// Classic ray tracing demonstration scene featuring three spheres on a ground
+/// plane with a gradient sky background. Good for testing reflections and basic
+/// materials.
+///
+/// Scene Contents:
+/// - Large red diffuse sphere (center)
+/// - Medium blue diffuse sphere (left)
+/// - Small gold metallic sphere (right)
+/// - Gray ground plane
+///
+/// # Returns
+/// * Scene configured with spheres preset
+///
+/// # Camera Recommendation
+/// * Position: (0, 1.2, 1.2)
+/// * Look-at: (0, 0.9, -2.8)
+/// * FOV: 55 degrees
+pub fn scene_spheres() -> Scene {
+    let mut scene = scene_empty();
+
+    // Material 0: Diffuse red (primary sphere)
+    scene.materials[0] = Material::Diffuse(MaterialDiffuse { albedo: vec3(0.8, 0.3, 0.2) });
+    // Material 1: Diffuse blue (secondary sphere)
+    scene.materials[1] = Material::Diffuse(MaterialDiffuse { albedo: vec3(0.2, 0.7, 0.9) });
+    // Material 2: Metal gold (reflective sphere)
+    scene.materials[2] = Material::Metal(MaterialMetal { albedo: vec3(0.9, 0.85, 0.7), roughness: 0.15 });
+    // Material 3: Gray ground
+    scene.materials[3] = Material::Diffuse(MaterialDiffuse { albedo: vec3(0.5, 0.5, 0.5) });
+    scene.num_materials = 4;
+
+    // Three spheres at different positions and sizes
+    scene.spheres[0] = Sphere { center: vec3(0.0, 1.0, -3.5), radius: 1.0, material_idx: 0 };
+    scene.spheres[1] = Sphere { center: vec3(-1.8, 0.9, -2.4), radius: 0.9, material_idx: 1 };
+    scene.spheres[2] = Sphere { center: vec3(1.7, 0.8, -2.0), radius: 0.8, material_idx: 2 };
+    scene.num_spheres = 3;
+
+    // Ground plane at y=0
+    scene.planes[0] = Plane { normal: vec3(0.0, 1.0, 0.0), distance: 0.0, material_idx: 3 };
+    scene.num_planes = 1;
+
+    // Light blue gradient sky
+    scene.background = vec3(0.6, 0.75, 0.95);
+
+    scene
+}
+
+/// Create the "cornell" preset scene
+///
+/// Classic Cornell box for testing global illumination. An enclosed box with
+/// colored walls and an area light on the ceiling. Standard benchmark for
+/// evaluating GI algorithms.
+///
+/// Scene Contents:
+/// - Red left wall
+/// - Green right wall
+/// - White floor, ceiling, and back wall
+/// - Area light on ceiling (emissive rectangle)
+/// - White diffuse sphere (left)
+/// - Mirror-like metal sphere (right)
+///
+/// # Returns
+/// * Scene configured with Cornell box preset
+///
+/// # Camera Recommendation
+/// * Position: (0, 2.5, 10)
+/// * Look-at: (0, 2.5, 0)
+/// * FOV: 40 degrees
+///
+/// # Reference
+/// Original Cornell box: https://www.graphics.cornell.edu/online/box/
+pub fn scene_cornell() -> Scene {
+    let mut scene = scene_empty();
+
+    // Material 0: Red wall (left side)
+    scene.materials[0] = Material::Diffuse(MaterialDiffuse { albedo: vec3(0.65, 0.05, 0.05) });
+    // Material 1: Green wall (right side)
+    scene.materials[1] = Material::Diffuse(MaterialDiffuse { albedo: vec3(0.12, 0.45, 0.15) });
+    // Material 2: White (floor, ceiling, back wall)
+    scene.materials[2] = Material::Diffuse(MaterialDiffuse { albedo: vec3(0.73, 0.73, 0.73) });
+    // Material 3: Ceiling light (emissive)
+    scene.materials[3] = Material::Emissive(MaterialEmissive { color: vec3(1.0, 1.0, 1.0), strength: 15.0 });
+    // Material 4: White diffuse (left sphere)
+    scene.materials[4] = Material::Diffuse(MaterialDiffuse { albedo: vec3(0.73, 0.73, 0.73) });
+    // Material 5: Mirror metal (right sphere)
+    scene.materials[5] = Material::Metal(MaterialMetal { albedo: vec3(0.9, 0.9, 0.9), roughness: 0.05 });
+    scene.num_materials = 6;
+
+    // Cornell box walls (axis-aligned rectangles)
+    // Axis encoding: 0=YZ plane (x=k), 1=XZ plane (y=k), 2=XY plane (z=k)
+    scene.rects[0] = Rect { x0: -2.5, x1: 2.5, y0: -2.5, y1: 2.5, k: 0.0, axis: 1, material_idx: 2 };   // Floor
+    scene.rects[1] = Rect { x0: -2.5, x1: 2.5, y0: -2.5, y1: 2.5, k: 5.0, axis: 1, material_idx: 2 };   // Ceiling
+    scene.rects[2] = Rect { x0: -2.5, x1: 2.5, y0: 0.0, y1: 5.0, k: -2.5, axis: 2, material_idx: 2 };   // Back
+    scene.rects[3] = Rect { x0: 0.0, x1: 5.0, y0: -2.5, y1: 2.5, k: -2.5, axis: 0, material_idx: 0 };   // Left (red)
+    scene.rects[4] = Rect { x0: 0.0, x1: 5.0, y0: -2.5, y1: 2.5, k: 2.5, axis: 0, material_idx: 1 };    // Right (green)
+    scene.rects[5] = Rect { x0: -1.0, x1: 1.0, y0: -1.0, y1: 1.0, k: 4.99, axis: 1, material_idx: 3 };  // Light
+    scene.num_rects = 6;
+
+    // Two spheres inside the box
+    scene.spheres[0] = Sphere { center: vec3(-1.0, 0.7, -1.0), radius: 0.7, material_idx: 4 };  // Diffuse
+    scene.spheres[1] = Sphere { center: vec3(1.2, 0.5, 0.5), radius: 0.5, material_idx: 5 };    // Metal
+    scene.num_spheres = 2;
+
+    // Black background (enclosed box, no sky visible)
+    scene.background = vec3(0.0, 0.0, 0.0);
+
+    scene
+}
+
+/// Create the "stress" preset scene
+///
+/// Performance stress test with maximum geometry. An 8x8 grid of spheres
+/// (64 total, the maximum capacity) on a ground plane. Useful for benchmarking
+/// intersection performance and memory bandwidth.
+///
+/// Scene Contents:
+/// - 64 spheres in an 8x8 grid pattern
+/// - Alternating materials (metal and colored diffuse)
+/// - Gray ground plane
+///
+/// # Returns
+/// * Scene configured with stress test preset
+///
+/// # Performance Notes
+/// This scene tests:
+/// - Ray-sphere intersection throughput
+/// - Material branching overhead
+/// - Memory access patterns for large object counts
+///
+/// # Camera Recommendation
+/// * Position: (0, 3, 12)
+/// * Look-at: (0, 1, 0)
+/// * FOV: 50 degrees
+pub fn scene_stress() -> Scene {
+    let mut scene = scene_empty();
+
+    // Material palette for the grid
+    scene.materials[0] = Material::Diffuse(MaterialDiffuse { albedo: vec3(0.5, 0.5, 0.5) });  // Ground
+    scene.materials[1] = Material::Metal(MaterialMetal { albedo: vec3(0.8, 0.8, 0.8), roughness: 0.3 });
+    scene.materials[2] = Material::Diffuse(MaterialDiffuse { albedo: vec3(0.8, 0.4, 0.4) });  // Red
+    scene.materials[3] = Material::Diffuse(MaterialDiffuse { albedo: vec3(0.4, 0.8, 0.4) });  // Green
+    scene.materials[4] = Material::Diffuse(MaterialDiffuse { albedo: vec3(0.4, 0.4, 0.8) });  // Blue
+    scene.num_materials = 5;
+
+    // Ground plane
+    scene.planes[0] = Plane { normal: vec3(0.0, 1.0, 0.0), distance: 0.0, material_idx: 0 };
+    scene.num_planes = 1;
+
+    // Generate 8x8 grid of spheres (64 total = MAX_SPHERES)
+    let grid_size = 8;
+    let sphere_spacing = 2.0;
+    let sphere_radius = 0.3;
+    let grid_offset = -8.0;  // Center grid around origin
+    let mut idx = 0;
+
+    for i in 0..grid_size {
+        for j in 0..grid_size {
+            // Safety check (should always be within bounds)
+            if idx >= MAX_SPHERES {
+                break;
+            }
+
+            // Position in grid with offset
+            let x = grid_offset + (i as f32) * sphere_spacing + 0.5;
+            let z = grid_offset + (j as f32) * sphere_spacing + 0.5;
+            let y = sphere_radius;  // Rest on ground
+
+            // Alternate materials based on grid position
+            let mat_idx = 1 + ((i + j) % 4);
+
+            scene.spheres[idx] = Sphere {
+                center: vec3(x, y, z),
+                radius: sphere_radius,
+                material_idx: mat_idx,
+            };
+
+            idx = idx + 1;
+        }
+    }
+
+    scene.num_spheres = idx;
+    scene.background = vec3(0.5, 0.6, 0.7);
+
+    scene
+}
+
+// =============================================================================
+// Ray-Scene Intersection
+// =============================================================================
+
+/// Find the closest intersection between a ray and all scene geometry
+///
+/// Tests the ray against all active primitives (spheres, rectangles, planes)
+/// and returns the closest hit within the [t_min, t_max] range.
+///
+/// # Algorithm
+/// Uses a brute-force O(n) scan of all primitives, updating the closest
+/// hit distance as we find nearer intersections. This approach is simple
+/// and GPU-friendly but scales linearly with scene complexity.
+///
+/// # Arguments
+/// * `scene` - Scene containing geometry to test (passed by reference for efficiency)
+/// * `r` - Ray to test for intersection
+/// * `t_min` - Minimum valid hit distance (prevents self-intersection)
+/// * `t_max` - Maximum valid hit distance (limits search range)
+///
+/// # Returns
+/// * HitRecord with did_hit=true if intersection found, false otherwise
+///
+/// # Performance Notes
+/// For large scenes (>100 objects), consider using a BVH acceleration structure.
+/// The current implementation is optimized for GPU coherence over CPU cache
+/// efficiency. Scene is passed by reference to avoid copying ~8KB of data.
+///
+/// # Complexity
+/// * Time: O(num_spheres + num_rects + num_planes)
+/// * Space: O(1) - no dynamic allocations
+pub fn scene_hit(scene: &Scene, r: Ray, t_min: f32, t_max: f32) -> HitRecord {
+    let mut closest_hit = hit_record_none();
+    let mut closest_t = t_max;
+
+    // Validate input range
+    if t_min >= t_max || t_min < 0.0 {
+        return closest_hit;
+    }
+
+    // Test all active spheres
+    // Spheres are typically the most common primitive
+    // Bounds check: i < num_spheres AND i < MAX_SPHERES (compile-time safety)
+    let sphere_count = if scene.num_spheres > MAX_SPHERES { MAX_SPHERES } else { scene.num_spheres };
+    for i in 0..sphere_count {
+        let hit = hit_sphere(scene.spheres[i], r, t_min, closest_t);
+        if hit.did_hit && hit.t < closest_t {
+            closest_t = hit.t;
+            closest_hit = hit;
+        }
+    }
+
+    // Test all active axis-aligned rectangles
+    // Used for Cornell box walls and area lights
+    let rect_count = if scene.num_rects > MAX_RECTS { MAX_RECTS } else { scene.num_rects };
+    for i in 0..rect_count {
+        let hit = hit_rect(scene.rects[i], r, t_min, closest_t);
+        if hit.did_hit && hit.t < closest_t {
+            closest_t = hit.t;
+            closest_hit = hit;
+        }
+    }
+
+    // Test all active infinite planes
+    // Typically used for ground planes
+    let plane_count = if scene.num_planes > MAX_PLANES { MAX_PLANES } else { scene.num_planes };
+    for i in 0..plane_count {
+        let hit = hit_plane(scene.planes[i], r, t_min, closest_t);
+        if hit.did_hit && hit.t < closest_t {
+            closest_t = hit.t;
+            closest_hit = hit;
+        }
+    }
+
+    closest_hit
+}
+
+/// Get a material from the scene by index
+///
+/// Safe accessor that returns a default material if index is out of bounds.
+///
+/// # Arguments
+/// * `scene` - Scene containing materials
+/// * `idx` - Material index (from HitRecord.material_idx)
+///
+/// # Returns
+/// * Material at the given index, or default diffuse gray if out of bounds
+#[inline]
+pub fn scene_get_material(scene: &Scene, idx: i32) -> Material {
+    if idx < 0 || idx >= scene.num_materials || idx >= MAX_MATERIALS {
+        // Return default gray diffuse material
+        Material::Diffuse(MaterialDiffuse { albedo: vec3(0.5, 0.5, 0.5) })
+    } else {
+        scene.materials[idx as usize]
+    }
+}
+
+/// Check if a material index is valid for this scene
+///
+/// # Arguments
+/// * `scene` - Scene to check
+/// * `idx` - Material index to validate
+///
+/// # Returns
+/// * true if index is valid, false otherwise
+#[inline]
+pub fn scene_material_valid(scene: &Scene, idx: i32) -> bool {
+    idx >= 0 && idx < scene.num_materials && idx < MAX_MATERIALS
+}

@@ -1,0 +1,25 @@
+# Auto detect text files and normalize line endings
+* text=auto
+
+# Shell scripts always LF
+*.sh text eol=lf
+
+# PowerShell scripts always CRLF (Windows)
+*.ps1 text eol=crlf
+
+# Source files LF
+*.md text eol=lf
+*.toml text eol=lf
+*.c text eol=lf
+*.cu text eol=lf
+*.h text eol=lf
+*.mind text eol=lf
+
+# Config files LF
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Batch files CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf

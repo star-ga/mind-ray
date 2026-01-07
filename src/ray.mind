@@ -1,0 +1,133 @@
+// ray.mind - Ray Representation for Mind Ray Path Tracer
+//
+// This module defines the Ray type used throughout the path tracer.
+// A ray represents a half-line in 3D space, defined by an origin point
+// and a direction vector.
+//
+// Mathematical Definition:
+//   P(t) = origin + t * direction, where t >= 0
+//
+// The direction is expected to be normalized (unit length) for most
+// operations, though some algorithms work with unnormalized directions.
+//
+// Author: Mind Ray Contributors
+// License: MIT
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Minimum valid direction length squared
+const MIN_DIR_LEN_SQ: f32 = 0.0000001;
+
+// =============================================================================
+// Ray Type
+// =============================================================================
+
+/// A ray in 3D space with origin and direction
+///
+/// Represents a half-line starting at `origin` and extending infinitely
+/// in the `direction`. The parametric form is P(t) = origin + t * direction.
+///
+/// # Invariants
+/// - direction should be normalized for correct intersection calculations
+/// - direction should be non-zero
+pub struct Ray {
+    /// Starting point of the ray in world space
+    origin: Vec3,
+    /// Direction of the ray (should be normalized)
+    direction: Vec3,
+}
+
+// =============================================================================
+// Ray Construction
+// =============================================================================
+
+/// Create a new ray from origin and direction
+///
+/// # Arguments
+/// * `origin` - Starting point of the ray
+/// * `direction` - Direction vector (should be normalized)
+///
+/// # Returns
+/// * New Ray with the specified origin and direction
+///
+/// # Note
+/// This constructor does not normalize the direction. Call v3_normalize
+/// on the direction before passing it if normalization is needed.
+/// For safety, use ray_new_normalized which handles normalization and
+/// validates the direction is non-zero.
+#[inline]
+pub fn ray_new(origin: Vec3, direction: Vec3) -> Ray {
+    Ray {
+        origin: origin,
+        direction: direction,
+    }
+}
+
+/// Create a new ray with automatic direction normalization
+///
+/// Safely normalizes the direction vector and handles degenerate cases.
+/// If direction is too small (near-zero), returns a ray pointing along +X.
+///
+/// # Arguments
+/// * `origin` - Starting point of the ray
+/// * `direction` - Direction vector (will be normalized)
+///
+/// # Returns
+/// * New Ray with the specified origin and normalized direction
+#[inline]
+pub fn ray_new_normalized(origin: Vec3, direction: Vec3) -> Ray {
+    let len_sq = v3_length_sq(direction);
+
+    // Handle degenerate direction: use default +X direction
+    if len_sq < MIN_DIR_LEN_SQ {
+        return Ray {
+            origin: origin,
+            direction: vec3(1.0, 0.0, 0.0),
+        };
+    }
+
+    Ray {
+        origin: origin,
+        direction: v3_normalize(direction),
+    }
+}
+
+/// Check if a ray has a valid (non-zero) direction
+///
+/// # Arguments
+/// * `r` - Ray to validate
+///
+/// # Returns
+/// * true if direction is non-zero, false otherwise
+#[inline]
+pub fn ray_is_valid(r: &Ray) -> bool {
+    v3_length_sq(r.direction) > MIN_DIR_LEN_SQ
+}
+
+// =============================================================================
+// Ray Evaluation
+// =============================================================================
+
+/// Evaluate the ray at parameter t
+///
+/// Returns the point along the ray at distance t from the origin
+/// (assuming direction is normalized).
+///
+/// # Arguments
+/// * `r` - Ray to evaluate
+/// * `t` - Parameter value (distance if direction is normalized)
+///
+/// # Returns
+/// * Point P(t) = origin + t * direction
+///
+/// # Example
+/// ```mind
+/// let ray = ray_new(vec3(0, 0, 0), vec3(1, 0, 0));
+/// let point = ray_at(ray, 5.0);  // Returns (5, 0, 0)
+/// ```
+#[inline]
+pub fn ray_at(r: Ray, t: f32) -> Vec3 {
+    v3_add(r.origin, v3_mul(r.direction, t))
+}

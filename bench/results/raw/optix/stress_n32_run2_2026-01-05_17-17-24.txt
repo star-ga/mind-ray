@@ -1,0 +1,22 @@
+﻿ENGINE=OptiX SDK Path Tracer
+SCENE=stress
+WIDTH=640
+HEIGHT=360
+SPP=64
+BOUNCES=4
+SPHERES=32
+SEED=0xDEADBEEF
+SCENE_HASH=0x1872671D
+TIMING_TIER=A
+optix_benchmark.exe : Using GPU: NVIDIA GeForce RTX 4070 Laptop GPU
+At C:\Users\Admin\projects\mind-ray\bench\run_three_engine_compare.ps1:115 char:23
++             $output = & $engine.Exe $args.Split(' ') 2>&1 | Out-Strin ...
++                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Using GPU: NVID...4070 Laptop GPU:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+KERNEL_MS_TOTAL=82.70
+KERNEL_MS_PER_FRAME=16.54
+KERNEL_SAMPLES_PER_SEC=891.6
+Samples/sec: 891.6M
+

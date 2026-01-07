@@ -1,0 +1,233 @@
+// rng.mind - Random Number Generation for Mind Ray Path Tracer
+//
+// This module implements a fast, deterministic pseudo-random number generator
+// based on the xorshift32 algorithm. The PRNG is designed for:
+//
+// - Reproducibility: Same seed always produces same sequence
+// - Speed: Simple bit operations, no division in hot path
+// - Quality: Sufficient randomness for Monte Carlo path tracing
+//
+// The functional design (returning new state) enables parallel execution
+// without locks or atomic operations.
+//
+// Algorithm: xorshift32 by George Marsaglia (2003)
+// Period: 2^32 - 1 (all non-zero 32-bit integers)
+//
+// Author: Mind Ray Contributors
+// License: MIT
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Minimum length squared for valid random vectors
+const MIN_VECTOR_LEN_SQ: f32 = 0.0001;
+
+/// Maximum rejection sampling attempts before fallback
+const MAX_REJECTION_ATTEMPTS: i32 = 100;
+
+/// Bit mask for extracting 24 bits for float conversion (unused, using shift instead)
+const FLOAT_BITS_MASK: u32 = 0x00FFFFFF;
+
+/// Divisor for converting 24-bit integer to [0, 1) float
+const FLOAT_DIVISOR: f32 = 16777216.0;  // 2^24
+
+// =============================================================================
+// RNG State
+// =============================================================================
+
+/// Immutable random number generator state
+///
+/// The xorshift algorithm uses a single 32-bit unsigned state word.
+/// Each call to rng_next produces a new value and state.
+/// Using u32 ensures correct logical right shifts (not arithmetic).
+///
+/// # Thread Safety
+/// RngState is immutable; each operation returns a new state.
+/// This allows lock-free parallel use with independent states.
+pub struct RngState {
+    /// Current 32-bit unsigned state (must never be zero)
+    state: u32,
+}
+
+// =============================================================================
+// Initialization
+// =============================================================================
+
+/// Initialize RNG with a seed value
+///
+/// Creates a new RNG state from the given seed. Zero is automatically
+/// converted to 1 since xorshift requires non-zero state.
+/// Negative seeds are handled via bitcast to ensure full u32 range.
+///
+/// # Arguments
+/// * `seed` - Seed value (0 is converted to 1)
+///
+/// # Returns
+/// * New RngState ready for use
+///
+/// # Determinism
+/// The same seed always produces the same sequence of random numbers.
+pub fn rng_init(seed: i32) -> RngState {
+    // Bitcast i32 to u32 to handle full range including negative seeds
+    let seed_u32 = seed as u32;
+    // xorshift32 has period 2^32-1 and cannot handle zero state
+    let s: u32 = if seed_u32 == 0 { 1 } else { seed_u32 };
+    RngState { state: s }
+}
+
+// =============================================================================
+// Core PRNG
+// =============================================================================
+
+/// Generate next random 32-bit unsigned integer
+///
+/// Implements the xorshift32 algorithm with parameters (13, 17, 5).
+/// Uses u32 to ensure correct logical right shifts.
+///
+/// # Arguments
+/// * `rng` - Current RNG state
+///
+/// # Returns
+/// * Tuple of (random_value, new_state)
+///
+/// # Algorithm
+/// The xorshift32 algorithm uses three XOR-shift operations:
+/// 1. x ^= x << 13
+/// 2. x ^= x >> 17 (logical shift, not arithmetic)
+/// 3. x ^= x << 5
+#[inline]
+pub fn rng_next(rng: RngState) -> (u32, RngState) {
+    let mut s: u32 = rng.state;
+    s = s ^ (s << 13);
+    s = s ^ (s >> 17);  // Logical right shift (u32 guarantees this)
+    s = s ^ (s << 5);
+    (s, RngState { state: s })
+}
+
+/// Generate random float in [0, 1)
+///
+/// Uses the upper 24 bits of the random integer for uniform distribution.
+/// Upper bits have better statistical properties than lower bits in xorshift.
+///
+/// # Arguments
+/// * `rng` - Current RNG state
+///
+/// # Returns
+/// * Tuple of (random_float in [0, 1), new_state)
+#[inline]
+pub fn rng_f32(rng: RngState) -> (f32, RngState) {
+    let (val, new_rng) = rng_next(rng);
+    // Use upper 24 bits for better randomness quality
+    let bits: u32 = val >> 8;
+    let f = (bits as f32) / FLOAT_DIVISOR;
+    (f, new_rng)
+}
+
+/// Generate random float in [min, max)
+///
+/// # Arguments
+/// * `rng` - Current RNG state
+/// * `min` - Minimum value (inclusive)
+/// * `max` - Maximum value (exclusive, must be > min)
+///
+/// # Returns
+/// * Tuple of (random_float in [min, max), new_state)
+///
+/// # Note
+/// If min >= max, returns min (degenerate case).
+#[inline]
+pub fn rng_f32_range(rng: RngState, min: f32, max: f32) -> (f32, RngState) {
+    let (f, new_rng) = rng_f32(rng);
+    // Handle degenerate case where min >= max
+    if min >= max {
+        return (min, new_rng);
+    }
+    let scaled = min + f * (max - min);
+    (scaled, new_rng)
+}
+
+// =============================================================================
+// Vector Sampling
+// =============================================================================
+
+/// Generate random point inside unit sphere
+///
+/// Uses rejection sampling: generates random points in [-1, 1]^3 cube
+/// and rejects those outside the unit sphere.
+///
+/// # Arguments
+/// * `rng` - Current RNG state
+///
+/// # Returns
+/// * Tuple of (random_vector inside unit sphere, new_state)
+///
+/// # Performance
+/// Average acceptance rate is ~52% (sphere volume / cube volume = pi/6).
+/// Maximum 100 attempts before fallback to prevent infinite loops.
+pub fn rng_vec3_unit_sphere(rng: RngState) -> (Vec3, RngState) {
+    let mut current_rng = rng;
+    let mut attempts = 0;
+
+    loop {
+        // Generate random point in [-1, 1]^3 cube
+        let (x, rng1) = rng_f32_range(current_rng, -1.0, 1.0);
+        let (y, rng2) = rng_f32_range(rng1, -1.0, 1.0);
+        let (z, rng3) = rng_f32_range(rng2, -1.0, 1.0);
+
+        let v = vec3(x, y, z);
+        let len_sq = v3_length_sq(v);
+
+        // Accept if inside unit sphere and not too close to zero
+        if len_sq < 1.0 && len_sq > MIN_VECTOR_LEN_SQ {
+            return (v, rng3);
+        }
+
+        current_rng = rng3;
+        attempts = attempts + 1;
+
+        // Fallback to prevent infinite loop (should never happen in practice)
+        if attempts > MAX_REJECTION_ATTEMPTS {
+            return (vec3(0.1, 0.1, 0.1), rng3);
+        }
+    }
+}
+
+/// Generate random unit vector (point on unit sphere surface)
+///
+/// # Arguments
+/// * `rng` - Current RNG state
+///
+/// # Returns
+/// * Tuple of (random unit vector, new_state)
+#[inline]
+pub fn rng_vec3_unit_vector(rng: RngState) -> (Vec3, RngState) {
+    let (v, new_rng) = rng_vec3_unit_sphere(rng);
+    (v3_normalize(v), new_rng)
+}
+
+/// Generate random unit vector in hemisphere around normal
+///
+/// Returns a random direction in the hemisphere centered on the given normal.
+/// Uses uniform hemisphere sampling (not cosine-weighted).
+///
+/// # Arguments
+/// * `rng` - Current RNG state
+/// * `normal` - Surface normal defining the hemisphere
+///
+/// # Returns
+/// * Tuple of (random unit vector in hemisphere, new_state)
+///
+/// # Note
+/// For cosine-weighted sampling, use sqrt(u) for polar angle instead.
+pub fn rng_vec3_in_hemisphere(rng: RngState, normal: Vec3) -> (Vec3, RngState) {
+    let (v, new_rng) = rng_vec3_unit_sphere(rng);
+    let v_norm = v3_normalize(v);
+
+    // Flip to same hemisphere as normal if needed
+    if v3_dot(v_norm, normal) > 0.0 {
+        (v_norm, new_rng)
+    } else {
+        (v3_neg(v_norm), new_rng)
+    }
+}

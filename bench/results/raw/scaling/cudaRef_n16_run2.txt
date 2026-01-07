@@ -1,0 +1,6 @@
+﻿KERNEL_MS_TOTAL=78.817
+KERNEL_MS_PER_FRAME=15.763
+KERNEL_SAMPLES_PER_SEC=935.429
+KERNEL_CONFIG width=640 height=360 spp=64 frames=5 bounces=4 spheres=16 seed=0xA341316C scene=stress
+SCENE_HASH=0x3B575E2D
+Wrote NUL (640x360, spp=64, frames=5)

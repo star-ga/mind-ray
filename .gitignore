@@ -1,0 +1,57 @@
+# Output
+output/
+out/
+*.png
+*.jpg
+*.ppm
+*.exr
+*.hdr
+
+# Temp files
+*.tmp
+*.log
+*.cache
+
+# Build artifacts
+build/
+target/
+bin/
+*.o
+*.obj
+*.lib
+*.dll
+*.so
+*.dylib
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Mind compiler
+*.mir
+*.ptx
+.mind-cache/
+toolchain/
+
+# Temporary files and secrets
+temp/**/.env
+
+# Archive (reference implementations)
+# Keep archive/ in repo for reference but ignore builds within it
+archive/*/bin/
+archive/*/build/
+
+# Third-party engine sources (cloned by build scripts)
+bench/third_party/
+
+# Generated scene files
+bench/engines/*/scenes/
+
+# Engine executables (built locally)
+bench/engines/*/*.exe

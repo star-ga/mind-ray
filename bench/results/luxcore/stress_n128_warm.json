@@ -1,0 +1,20 @@
+﻿{
+    "device":  "GPU",
+    "timestamp":  "2026-01-06T21:16:13",
+    "tier":  "B",
+    "wall_ms_max":  5060.64,
+    "wall_ms_min":  4030.14,
+    "warmup_runs":  1,
+    "run_mode":  "WARM",
+    "wall_ms_median":  5045.03,
+    "engine_version":  "2.8alpha1",
+    "device_name":  "NVIDIA GeForce RTX 4070 Laptop GPU",
+    "engine":  "LuxCore",
+    "scene":  "stress_n128",
+    "wall_ms_all":  [
+                        4030.14,
+                        5045.03,
+                        5060.64
+                    ],
+    "timed_runs":  3
+}

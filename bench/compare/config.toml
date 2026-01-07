@@ -1,0 +1,41 @@
+# Benchmark Configuration
+# Version: 1.0
+
+[settings]
+resolution_width = 640
+resolution_height = 360
+spp = 64
+bounces = 4
+seed = 42
+warmup_frames = 2
+measured_frames = 5
+runs_per_benchmark = 3
+cooldown_seconds = 5
+
+[scenes]
+enabled = ["spheres", "cornell", "stress"]
+
+[engines]
+# Tier A: Required
+[engines.mindray_cuda]
+enabled = true
+path = "bench/cuda_benchmark.exe"
+dll = "bench/mindray_cuda.dll"
+args_template = "--scene {scene} --width {width} --height {height} --spp {spp} --bounces {bounces}"
+
+[engines.cuda_reference]
+enabled = true
+path = "archive/cuda_reference/bin/raytracer.exe"
+args_template = "--w {width} --h {height} --spp {spp} --frames {frames}"
+notes = "No scene/bounces control; single hardcoded scene"
+
+# Tier B: Optional industry baselines
+[engines.optix_sample]
+enabled = false
+path = ""
+notes = "Requires OptiX SDK installation"
+
+[engines.taichi]
+enabled = false
+path = ""
+notes = "Requires Taichi Python environment"

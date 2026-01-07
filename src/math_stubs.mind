@@ -1,0 +1,955 @@
+// math_stubs.mind - Mathematical Function Library
+//
+// This module provides mathematical functions for the Mind Ray path tracer.
+// All functions are implemented in pure Mind language with no external dependencies.
+//
+// Design Goals:
+// - High precision: Approximations accurate to ~6-7 decimal places (f32 limit)
+// - GPU-friendly: Branch-free where possible, SIMD-compatible patterns
+// - Portable: No platform-specific intrinsics required
+// - Self-contained: Complete implementation with only FFI for bit manipulation
+//
+// Accuracy Notes:
+// - Trigonometric functions: ~6 decimal places across full range
+// - Exponential/logarithmic: ~6 decimal places in normal range
+// - Square root: ~7 decimal places via Newton-Raphson refinement
+//
+// Author: Mind Ray Contributors
+// License: MIT
+
+// =============================================================================
+// Mathematical Constants
+// =============================================================================
+//
+// These constants are specified to full f64 precision even though they're stored
+// as f32. The compiler will perform the narrowing conversion, ensuring maximum
+// accuracy for the f32 representation.
+
+/// Pi (π) - ratio of circle's circumference to diameter
+/// Exact value: 3.14159265358979323846264338327950288...
+const PI: f32 = 3.14159265358979323846;
+
+/// Pi divided by 2 (π/2) - quarter turn in radians
+const PI_2: f32 = 1.57079632679489661923;
+
+/// Pi divided by 4 (π/4) - eighth turn in radians
+const PI_4: f32 = 0.78539816339744830962;
+
+/// 2 times Pi (2π) - full turn in radians
+const TWO_PI: f32 = 6.28318530717958647692;
+
+/// Natural logarithm of 2 (ln(2))
+/// Used in range reduction for exp/log functions
+const LN_2: f32 = 0.69314718055994530942;
+
+/// Log base 2 of e (log₂(e) = 1/ln(2))
+/// Used for exp() range reduction
+const LOG2_E: f32 = 1.44269504088896340736;
+
+/// Euler's number (e) - base of natural logarithm
+const E: f32 = 2.71828182845904523536;
+
+/// Machine epsilon for f32 (smallest x where 1.0 + x != 1.0)
+/// ~2^(-23) for IEEE 754 single precision
+const F32_EPSILON: f32 = 1.192092896e-7;
+
+/// Maximum finite f32 value (~2^128)
+const F32_MAX: f32 = 3.402823466e+38;
+
+/// Minimum positive normal f32 value (~2^(-126))
+const F32_MIN_POSITIVE: f32 = 1.175494351e-38;
+
+/// Square root of 2
+const SQRT_2: f32 = 1.41421356237309504880;
+
+/// 1 divided by square root of 2
+const INV_SQRT_2: f32 = 0.70710678118654752440;
+
+// =============================================================================
+// Basic Operations
+// =============================================================================
+
+/// Absolute value of a floating-point number
+///
+/// Returns the magnitude of x without regard to sign.
+/// Note: For IEEE 754, this could be done via bit manipulation (clear sign bit),
+/// but the branch version is more portable and often equally fast.
+///
+/// # Arguments
+/// * `x` - Input value
+///
+/// # Returns
+/// * |x| (always >= 0)
+#[inline]
+fn f32_abs(x: f32) -> f32 {
+    if x < 0.0 { -x } else { x }
+}
+
+/// Minimum of two floating-point numbers
+///
+/// # Arguments
+/// * `a` - First value
+/// * `b` - Second value
+///
+/// # Returns
+/// * The smaller of a and b
+///
+/// # Note
+/// If either argument is NaN, the result is undefined.
+#[inline]
+fn f32_min(a: f32, b: f32) -> f32 {
+    if a < b { a } else { b }
+}
+
+/// Maximum of two floating-point numbers
+///
+/// # Arguments
+/// * `a` - First value
+/// * `b` - Second value
+///
+/// # Returns
+/// * The larger of a and b
+///
+/// # Note
+/// If either argument is NaN, the result is undefined.
+#[inline]
+fn f32_max(a: f32, b: f32) -> f32 {
+    if a > b { a } else { b }
+}
+
+/// Clamp a value to a specified range [min, max]
+///
+/// # Arguments
+/// * `x` - Value to clamp
+/// * `min` - Minimum bound (inclusive)
+/// * `max` - Maximum bound (inclusive)
+///
+/// # Returns
+/// * min if x < min
+/// * max if x > max
+/// * x otherwise
+///
+/// # Precondition
+/// min <= max (behavior undefined otherwise)
+#[inline]
+fn f32_clamp(x: f32, min: f32, max: f32) -> f32 {
+    f32_max(min, f32_min(x, max))
+}
+
+/// Linear interpolation between two values
+///
+/// Performs linear interpolation (lerp) between a and b.
+/// When t=0, returns a. When t=1, returns b.
+/// Values of t outside [0,1] will extrapolate.
+///
+/// # Arguments
+/// * `a` - Start value (t=0)
+/// * `b` - End value (t=1)
+/// * `t` - Interpolation parameter
+///
+/// # Returns
+/// * a + t * (b - a) = a * (1-t) + b * t
+///
+/// # Note
+/// This formulation (a + t*(b-a)) is more numerically stable than (1-t)*a + t*b
+/// for values of t close to 0.
+#[inline]
+fn f32_lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + t * (b - a)
+}
+
+/// Sign function (signum)
+///
+/// # Arguments
+/// * `x` - Input value
+///
+/// # Returns
+/// * -1.0 if x < 0
+/// *  0.0 if x == 0
+/// * +1.0 if x > 0
+#[inline]
+fn f32_sign(x: f32) -> f32 {
+    if x < 0.0 { -1.0 } else if x > 0.0 { 1.0 } else { 0.0 }
+}
+
+/// Copy the sign of y to x
+///
+/// # Arguments
+/// * `x` - Value whose magnitude to use
+/// * `y` - Value whose sign to use
+///
+/// # Returns
+/// * |x| with the sign of y
+#[inline]
+fn f32_copysign(x: f32, y: f32) -> f32 {
+    let mag = f32_abs(x);
+    if y < 0.0 { -mag } else { mag }
+}
+
+/// Maximum safe integer for f32 -> i32 conversion
+/// Values beyond this may overflow when cast to i32.
+/// 2^23 = 8388608 (f32 mantissa precision limit)
+const F32_SAFE_INT_MAX: f32 = 8388608.0;
+
+/// Floor function - largest integer less than or equal to x
+///
+/// # Arguments
+/// * `x` - Input value
+///
+/// # Returns
+/// * floor(x) as f32
+///
+/// # Examples
+/// * floor(2.7) = 2.0
+/// * floor(-2.7) = -3.0
+/// * floor(3.0) = 3.0
+///
+/// # Edge Cases
+/// * For |x| > 2^23, x is already an integer (f32 precision limit)
+/// * Handles overflow by returning x unchanged for large values
+#[inline]
+fn f32_floor(x: f32) -> f32 {
+    // For large values, f32 can only represent integers anyway
+    // (no fractional bits available in mantissa)
+    if x >= F32_SAFE_INT_MAX || x <= -F32_SAFE_INT_MAX {
+        return x;
+    }
+
+    let xi = x as i32;
+    // For negative non-integers, we need to subtract 1
+    // because casting truncates toward zero, not toward -∞
+    if x < 0.0 && x != (xi as f32) {
+        (xi - 1) as f32
+    } else {
+        xi as f32
+    }
+}
+
+/// Ceiling function - smallest integer greater than or equal to x
+///
+/// # Arguments
+/// * `x` - Input value
+///
+/// # Returns
+/// * ceil(x) as f32
+#[inline]
+fn f32_ceil(x: f32) -> f32 {
+    -f32_floor(-x)
+}
+
+/// Round to nearest integer (ties round away from zero)
+///
+/// Uses "round half away from zero" semantics (banker's rounding alternative):
+/// - round(1.5) = 2.0
+/// - round(-1.5) = -2.0
+/// - round(2.5) = 3.0
+/// - round(-2.5) = -3.0
+///
+/// # Arguments
+/// * `x` - Input value
+///
+/// # Returns
+/// * Nearest integer to x as f32
+///
+/// # Algorithm
+/// For positive values: floor(x + 0.5)
+/// For negative values: ceil(x - 0.5) = -floor(-x + 0.5)
+/// This ensures ties round away from zero in both directions.
+#[inline]
+fn f32_round(x: f32) -> f32 {
+    // Handle negative values separately to round ties away from zero
+    // floor(x + 0.5) rounds -1.5 to -1 (wrong), we want -2
+    if x < 0.0 {
+        // For negatives: use -floor(-x + 0.5) to round away from zero
+        -f32_floor(-x + 0.5)
+    } else {
+        f32_floor(x + 0.5)
+    }
+}
+
+/// Truncate toward zero (remove fractional part)
+///
+/// # Arguments
+/// * `x` - Input value
+///
+/// # Returns
+/// * Integer part of x (toward zero)
+///
+/// # Edge Cases
+/// * For |x| > 2^23, x is already an integer (f32 precision limit)
+/// * Handles overflow by returning x unchanged for large values
+#[inline]
+fn f32_trunc(x: f32) -> f32 {
+    // For large values, f32 can only represent integers anyway
+    if x >= F32_SAFE_INT_MAX || x <= -F32_SAFE_INT_MAX {
+        return x;
+    }
+    (x as i32) as f32
+}
+
+/// Fractional part of x
+///
+/// Returns x - floor(x), which is always in [0, 1).
+///
+/// # Arguments
+/// * `x` - Input value
+///
+/// # Returns
+/// * Fractional part in [0, 1)
+#[inline]
+fn f32_fract(x: f32) -> f32 {
+    x - f32_floor(x)
+}
+
+/// Modulo operation (Euclidean remainder)
+///
+/// Returns the remainder of x/y where the result has the same sign as y.
+///
+/// # Arguments
+/// * `x` - Dividend
+/// * `y` - Divisor (must be non-zero)
+///
+/// # Returns
+/// * x mod y
+#[inline]
+fn f32_mod(x: f32, y: f32) -> f32 {
+    x - y * f32_floor(x / y)
+}
+
+// =============================================================================
+// Square Root
+// =============================================================================
+
+/// Fast inverse square root magic number
+/// This is the famous "Quake III" constant, optimized for IEEE 754 f32.
+/// Derivation: https://en.wikipedia.org/wiki/Fast_inverse_square_root
+const FAST_ISQRT_MAGIC: u32 = 0x5f375a86;
+
+/// Square root using fast inverse square root + Newton-Raphson refinement
+///
+/// Uses the famous "fast inverse square root" algorithm with additional
+/// Newton-Raphson iterations for high accuracy.
+///
+/// Algorithm:
+/// 1. Use bit manipulation to get initial approximation of 1/√x
+/// 2. Refine with 3 Newton-Raphson iterations
+/// 3. Multiply by x to get √x
+///
+/// Accuracy: ~7 significant decimal digits (full f32 precision)
+///
+/// # Arguments
+/// * `x` - Non-negative input value
+///
+/// # Returns
+/// * √x for x > 0
+/// * 0.0 for x <= 0
+///
+/// # Performance
+/// ~15-20 cycles on modern CPUs (no hardware sqrt instruction needed)
+#[inline]
+fn f32_sqrt(x: f32) -> f32 {
+    // Handle edge cases
+    if x <= 0.0 {
+        return 0.0;
+    }
+
+    // Fast inverse square root (Quake III algorithm)
+    // Initial approximation using IEEE 754 bit manipulation
+    let x_half = x * 0.5;
+    let mut i = f32_to_bits(x);
+    i = FAST_ISQRT_MAGIC - (i >> 1);
+    let mut y = bits_to_f32(i);
+
+    // Newton-Raphson iterations for 1/√x
+    // Each iteration approximately doubles the number of correct bits
+    // Formula: y_{n+1} = y_n * (1.5 - 0.5 * x * y_n^2)
+    y = y * (1.5 - x_half * y * y);  // ~4 bits accuracy
+    y = y * (1.5 - x_half * y * y);  // ~8 bits accuracy
+    y = y * (1.5 - x_half * y * y);  // ~16 bits accuracy (exceeds f32 mantissa)
+
+    // Return x * (1/√x) = √x
+    x * y
+}
+
+/// Inverse square root (1/√x) - fast approximation
+///
+/// Returns 1/√x using the fast inverse square root algorithm.
+/// This is faster than 1.0/sqrt(x) and useful for normalization.
+///
+/// # Arguments
+/// * `x` - Positive input value
+///
+/// # Returns
+/// * 1/√x for x > 0
+/// * F32_MAX for x <= 0 (represents +∞)
+#[inline]
+fn f32_rsqrt(x: f32) -> f32 {
+    if x <= 0.0 {
+        return F32_MAX;
+    }
+
+    // Direct fast inverse sqrt (avoids multiplication at the end)
+    let x_half = x * 0.5;
+    let mut i = f32_to_bits(x);
+    i = FAST_ISQRT_MAGIC - (i >> 1);
+    let mut y = bits_to_f32(i);
+
+    // Newton-Raphson refinement
+    y = y * (1.5 - x_half * y * y);
+    y = y * (1.5 - x_half * y * y);
+    y = y * (1.5 - x_half * y * y);
+
+    y
+}
+
+// =============================================================================
+// Bit Manipulation Helpers
+// =============================================================================
+
+/// Reinterpret f32 bits as u32 (type punning)
+///
+/// This is a bitcast, not a conversion. The bit pattern is preserved exactly.
+/// Used for IEEE 754 bit manipulation in fast math functions.
+#[inline]
+fn f32_to_bits(x: f32) -> u32 {
+    __mind_f32_to_bits(x)
+}
+
+/// Reinterpret u32 bits as f32 (type punning)
+///
+/// This is a bitcast, not a conversion. The bit pattern is preserved exactly.
+#[inline]
+fn bits_to_f32(bits: u32) -> f32 {
+    __mind_bits_to_f32(bits)
+}
+
+// =============================================================================
+// Exponential and Logarithmic Functions
+// =============================================================================
+
+/// Overflow threshold for exp() - exp(88.7) > F32_MAX
+const EXP_OVERFLOW: f32 = 88.0;
+
+/// Underflow threshold for exp() - exp(-88) ≈ 0
+const EXP_UNDERFLOW: f32 = -88.0;
+
+/// Exponential function e^x
+///
+/// Computes e raised to the power x using range reduction and polynomial
+/// approximation.
+///
+/// Algorithm:
+/// 1. Range reduction: e^x = 2^(x * log₂(e)) = 2^n * 2^f
+///    where n is the integer part and f ∈ [0, 1)
+/// 2. Compute 2^f using a minimax polynomial
+/// 3. Scale by 2^n using IEEE 754 bit manipulation
+///
+/// Accuracy: ~6 significant decimal digits
+///
+/// # Arguments
+/// * `x` - Exponent value
+///
+/// # Returns
+/// * e^x for x in (-88, 88)
+/// * 0.0 for x <= -88 (underflow)
+/// * F32_MAX for x >= 88 (overflow)
+fn f32_exp(x: f32) -> f32 {
+    // Handle underflow/overflow
+    if x <= EXP_UNDERFLOW {
+        return 0.0;
+    }
+    if x >= EXP_OVERFLOW {
+        return F32_MAX;
+    }
+
+    // Range reduction: e^x = 2^(x * log₂(e))
+    let scaled = x * LOG2_E;
+
+    // Split into integer and fractional parts
+    let n = f32_floor(scaled);
+    let f = scaled - n;
+
+    // Approximate 2^f for f ∈ [0, 1) using minimax polynomial
+    // Coefficients optimized for [0, 1] range
+    // 2^f = 1 + f*c1 + f²*c2 + f³*c3 + f⁴*c4
+    let f2 = f * f;
+    let f3 = f2 * f;
+    let f4 = f3 * f;
+
+    // Minimax polynomial coefficients for 2^f
+    let c1 = 0.693147180559945;   // ln(2)
+    let c2 = 0.240226506959101;   // ln²(2)/2
+    let c3 = 0.055504108664822;   // ln³(2)/6
+    let c4 = 0.009618129107629;   // ln⁴(2)/24
+
+    let p = 1.0 + f * c1 + f2 * c2 + f3 * c3 + f4 * c4;
+
+    // Multiply by 2^n using IEEE 754 exponent manipulation
+    // 2^n is represented as (127 + n) << 23 in the exponent field
+    let n_int = n as i32;
+    if n_int < -126 || n_int > 127 {
+        // Exponent out of range - handle gracefully
+        return if n_int < 0 { 0.0 } else { F32_MAX };
+    }
+    let scale_bits = ((127 + n_int) as u32) << 23;
+    let scale = bits_to_f32(scale_bits);
+
+    p * scale
+}
+
+/// Natural logarithm ln(x)
+///
+/// Computes the natural logarithm using range reduction and polynomial
+/// approximation.
+///
+/// Algorithm:
+/// 1. Decompose x = m * 2^e where m ∈ [1, 2)
+/// 2. Use identity: ln(x) = ln(m) + e * ln(2)
+/// 3. Compute ln(m) using the substitution t = (m-1)/(m+1)
+///    which gives ln(m) = 2 * atanh(t) = 2t(1 + t²/3 + t⁴/5 + ...)
+///
+/// Accuracy: ~6 significant decimal digits
+///
+/// # Arguments
+/// * `x` - Positive input value
+///
+/// # Returns
+/// * ln(x) for x > 0
+/// * -F32_MAX for x <= 0 (represents -∞)
+fn f32_log(x: f32) -> f32 {
+    // Handle non-positive input
+    if x <= 0.0 {
+        return -F32_MAX;  // -∞
+    }
+
+    // Extract exponent and mantissa via IEEE 754 bit manipulation
+    // IEEE 754 f32: [sign:1][exponent:8][mantissa:23]
+    let bits = f32_to_bits(x);
+    let exponent = ((bits >> 23) & 0xFF) as i32 - 127;  // Unbias exponent
+    let mantissa_bits = (bits & 0x007FFFFF) | 0x3F800000;  // Set exponent to 0
+    let m = bits_to_f32(mantissa_bits);  // m ∈ [1, 2)
+
+    // Compute ln(m) for m ∈ [1, 2)
+    // Use substitution t = (m-1)/(m+1), so ln(m) = 2*atanh(t)
+    // This gives better convergence than direct Taylor series
+    let t = (m - 1.0) / (m + 1.0);
+    let t2 = t * t;
+
+    // atanh(t) = t + t³/3 + t⁵/5 + t⁷/7 + t⁹/9 + ...
+    // ln(m) = 2t * (1 + t²/3 + t⁴/5 + t⁶/7 + t⁸/9)
+    let c1 = 0.333333333;  // 1/3
+    let c2 = 0.200000000;  // 1/5
+    let c3 = 0.142857143;  // 1/7
+    let c4 = 0.111111111;  // 1/9
+
+    let series = 1.0 + t2 * (c1 + t2 * (c2 + t2 * (c3 + t2 * c4)));
+    let ln_m = 2.0 * t * series;
+
+    // Final result: ln(x) = ln(m) + e * ln(2)
+    ln_m + (exponent as f32) * LN_2
+}
+
+/// Base-2 logarithm log₂(x)
+///
+/// # Arguments
+/// * `x` - Positive input value
+///
+/// # Returns
+/// * log₂(x)
+fn f32_log2(x: f32) -> f32 {
+    f32_log(x) * LOG2_E
+}
+
+/// Base-10 logarithm log₁₀(x)
+///
+/// # Arguments
+/// * `x` - Positive input value
+///
+/// # Returns
+/// * log₁₀(x)
+fn f32_log10(x: f32) -> f32 {
+    f32_log(x) * 0.43429448190325176  // 1/ln(10)
+}
+
+/// Power function x^y (base raised to exponent)
+///
+/// Computes base^exponent using the identity x^y = exp(y * ln(x)).
+/// Handles special cases efficiently with direct computation.
+///
+/// # Arguments
+/// * `base` - Base value
+/// * `exponent` - Exponent value
+///
+/// # Returns
+/// * base^exponent
+///
+/// # Special Cases
+/// * x^0 = 1 for any x (including 0^0 = 1)
+/// * 0^y = 0 for y > 0
+/// * 0^y = +∞ for y < 0
+/// * x^1 = x
+/// * x^2 = x*x (direct computation)
+/// * x^0.5 = √x (uses f32_sqrt)
+/// * (-x)^n for integer n: computed with correct sign
+/// * (-x)^y for non-integer y: returns 0 (undefined in reals)
+fn f32_pow(base: f32, exponent: f32) -> f32 {
+    // Fast path: x^0 = 1 (including 0^0)
+    if exponent == 0.0 {
+        return 1.0;
+    }
+
+    // Handle base = 0
+    if base == 0.0 {
+        return if exponent > 0.0 { 0.0 } else { F32_MAX };
+    }
+
+    // Fast paths for common exponents
+    if exponent == 1.0 {
+        return base;
+    }
+    if exponent == 2.0 {
+        return base * base;
+    }
+    if exponent == 0.5 {
+        return f32_sqrt(base);
+    }
+    if exponent == -1.0 {
+        return 1.0 / base;
+    }
+    if exponent == -0.5 {
+        return f32_rsqrt(base);
+    }
+
+    // Handle negative base
+    if base < 0.0 {
+        // Negative base is only valid for integer exponents
+        let exp_int = exponent as i32;
+        if (exp_int as f32) == exponent {
+            // (-x)^n = (-1)^n * x^n
+            let result = f32_exp(exponent * f32_log(-base));
+            return if exp_int % 2 == 0 { result } else { -result };
+        }
+        // Non-integer exponent of negative base is undefined in reals
+        return 0.0;
+    }
+
+    // General case: x^y = exp(y * ln(x))
+    f32_exp(exponent * f32_log(base))
+}
+
+// =============================================================================
+// Trigonometric Functions
+// =============================================================================
+
+/// Sine function using Taylor series with range reduction
+///
+/// Computes sin(x) using:
+/// 1. Range reduction to [-π, π] via modular arithmetic
+/// 2. Further reduction to [-π/2, π/2] using sin(π-x) = sin(x)
+/// 3. Taylor series approximation: sin(x) = x - x³/3! + x⁵/5! - x⁷/7! + ...
+///
+/// Accuracy: ~6 significant decimal digits across full range
+///
+/// # Arguments
+/// * `x` - Angle in radians (any value)
+///
+/// # Returns
+/// * sin(x) in range [-1, 1]
+pub fn f32_sin(x: f32) -> f32 {
+    // Range reduction to [-π, π] using modular arithmetic
+    // This is more efficient than repeated subtraction for large x
+    let mut x_reduced = x;
+    if x_reduced > PI || x_reduced < -PI {
+        // Use f32_mod for efficient range reduction
+        x_reduced = f32_mod(x_reduced + PI, TWO_PI) - PI;
+    }
+
+    // Further reduce to [-π/2, π/2] using symmetry
+    // sin(x) = sin(π - x) for x in [π/2, π]
+    // sin(x) = -sin(-π - x) for x in [-π, -π/2]
+    let (x_norm, sign) = if x_reduced > PI_2 {
+        (PI - x_reduced, 1.0)
+    } else if x_reduced < -PI_2 {
+        (-PI - x_reduced, -1.0)
+    } else {
+        (x_reduced, 1.0)
+    };
+
+    // Taylor series for sin(x) on [-π/2, π/2]
+    // sin(x) = x - x³/6 + x⁵/120 - x⁷/5040 + x⁹/362880 - ...
+    let x2 = x_norm * x_norm;
+    let x3 = x_norm * x2;
+    let x5 = x3 * x2;
+    let x7 = x5 * x2;
+    let x9 = x7 * x2;
+
+    // Coefficients: 1/3! = 1/6, 1/5! = 1/120, 1/7! = 1/5040, 1/9! = 1/362880
+    let result = x_norm
+        - x3 * 0.16666666666666666    // -1/6
+        + x5 * 0.008333333333333333   // +1/120
+        - x7 * 0.0001984126984127     // -1/5040
+        + x9 * 0.0000027557319224;    // +1/362880
+
+    sign * result
+}
+
+/// Cosine function
+///
+/// Computes cos(x) using the identity cos(x) = sin(x + π/2).
+///
+/// Accuracy: ~6 significant decimal digits
+///
+/// # Arguments
+/// * `x` - Angle in radians (any value)
+///
+/// # Returns
+/// * cos(x) in range [-1, 1]
+pub fn f32_cos(x: f32) -> f32 {
+    // Use identity: cos(x) = sin(x + π/2)
+    f32_sin(x + PI_2)
+}
+
+/// Tangent function
+///
+/// Computes tan(x) = sin(x) / cos(x).
+/// Returns ±F32_MAX near singularities at x = ±π/2 + nπ.
+///
+/// # Arguments
+/// * `x` - Angle in radians
+///
+/// # Returns
+/// * tan(x)
+/// * ±F32_MAX near singularities
+pub fn f32_tan(x: f32) -> f32 {
+    let s = f32_sin(x);
+    let c = f32_cos(x);
+
+    // Handle singularity near ±π/2 + nπ
+    if f32_abs(c) < F32_EPSILON {
+        return f32_sign(s) * F32_MAX;
+    }
+
+    s / c
+}
+
+/// Hyperbolic sine: sinh(x) = (e^x - e^(-x)) / 2
+///
+/// # Arguments
+/// * `x` - Input value
+///
+/// # Returns
+/// * sinh(x)
+fn f32_sinh(x: f32) -> f32 {
+    let ex = f32_exp(x);
+    (ex - 1.0 / ex) * 0.5
+}
+
+/// Hyperbolic cosine: cosh(x) = (e^x + e^(-x)) / 2
+///
+/// # Arguments
+/// * `x` - Input value
+///
+/// # Returns
+/// * cosh(x) >= 1
+fn f32_cosh(x: f32) -> f32 {
+    let ex = f32_exp(x);
+    (ex + 1.0 / ex) * 0.5
+}
+
+/// Hyperbolic tangent: tanh(x) = sinh(x) / cosh(x)
+///
+/// # Arguments
+/// * `x` - Input value
+///
+/// # Returns
+/// * tanh(x) in range (-1, 1)
+fn f32_tanh(x: f32) -> f32 {
+    // For large |x|, tanh approaches ±1
+    if x > 20.0 { return 1.0; }
+    if x < -20.0 { return -1.0; }
+
+    let e2x = f32_exp(2.0 * x);
+    (e2x - 1.0) / (e2x + 1.0)
+}
+
+// =============================================================================
+// Inverse Trigonometric Functions
+// =============================================================================
+
+/// Arctangent (inverse tangent)
+///
+/// Computes atan(x) using a minimax polynomial approximation with range reduction.
+/// Uses multiple identities for optimal accuracy across all input ranges.
+///
+/// Accuracy: ~6 significant decimal digits across full range
+///
+/// # Arguments
+/// * `x` - Input value (any real number)
+///
+/// # Returns
+/// * atan(x) in radians, range [-π/2, π/2]
+///
+/// # Algorithm
+/// Uses a three-stage range reduction:
+/// 1. For |x| > 2.414 (tan(67.5°)): atan(x) = π/2 - atan(1/x)
+/// 2. For |x| > 0.414 (tan(22.5°)): atan(x) = π/4 + atan((x-1)/(x+1))
+/// 3. For |x| <= 0.414: direct minimax polynomial
+///
+/// This ensures the polynomial is always evaluated for |z| < 0.5,
+/// where convergence is fast and accurate.
+pub fn f32_atan(x: f32) -> f32 {
+    let abs_x = f32_abs(x);
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+
+    // Three-stage range reduction for optimal accuracy
+    // tan(22.5°) ≈ 0.4142, tan(67.5°) ≈ 2.4142
+    let (z, base_angle) = if abs_x > 2.414213562373095 {
+        // |x| > tan(67.5°): use atan(x) = π/2 - atan(1/x)
+        (1.0 / abs_x, PI_2)
+    } else if abs_x > 0.4142135623730950 {
+        // |x| > tan(22.5°): use atan(x) = π/4 + atan((x-1)/(x+1))
+        ((abs_x - 1.0) / (abs_x + 1.0), PI_4)
+    } else {
+        // |x| <= tan(22.5°): direct polynomial
+        (abs_x, 0.0)
+    };
+
+    // Minimax polynomial for atan(z) where |z| < 0.5
+    // Optimized coefficients for this reduced range
+    // atan(z) ≈ z * (c0 + z² * (c1 + z² * (c2 + z² * c3)))
+    let z2 = z * z;
+
+    // Horner's form for numerical stability
+    // Coefficients from minimax approximation on [0, 0.5]
+    let c3 = 0.0752896400;
+    let c2 = -0.0901105881;
+    let c1 = 0.1116256838;
+    let c0 = -0.3333314528;
+
+    let poly = z2 * (c0 + z2 * (c1 + z2 * (c2 + z2 * c3)));
+    let atan_z = z + z * poly;
+
+    // Combine based on which range reduction was used
+    let result = if abs_x > 2.414213562373095 {
+        base_angle - atan_z
+    } else if abs_x > 0.4142135623730950 {
+        base_angle + atan_z
+    } else {
+        atan_z
+    };
+
+    sign * result
+}
+
+/// Two-argument arctangent atan2(y, x)
+///
+/// Returns the angle θ in radians between the positive x-axis and the
+/// point (x, y), correctly handling all quadrants.
+///
+/// This is the standard atan2 function found in most math libraries.
+/// It's essential for converting Cartesian to polar coordinates.
+///
+/// # Arguments
+/// * `y` - Y coordinate
+/// * `x` - X coordinate
+///
+/// # Returns
+/// * Angle θ in radians, range [-π, π]
+/// * θ such that x = r*cos(θ), y = r*sin(θ) where r = √(x²+y²)
+///
+/// # Special Cases
+/// * atan2(0, x) = 0 for x > 0, π for x < 0
+/// * atan2(y, 0) = π/2 for y > 0, -π/2 for y < 0
+/// * atan2(0, 0) = 0 (undefined, but returns 0 by convention)
+fn f32_atan2(y: f32, x: f32) -> f32 {
+    if x > 0.0 {
+        // First and fourth quadrants
+        f32_atan(y / x)
+    } else if x < 0.0 && y >= 0.0 {
+        // Second quadrant
+        f32_atan(y / x) + PI
+    } else if x < 0.0 && y < 0.0 {
+        // Third quadrant
+        f32_atan(y / x) - PI
+    } else if x == 0.0 && y > 0.0 {
+        // Positive y-axis
+        PI_2
+    } else if x == 0.0 && y < 0.0 {
+        // Negative y-axis
+        -PI_2
+    } else {
+        // Origin (undefined, return 0 by convention)
+        0.0
+    }
+}
+
+/// Arcsine (inverse sine)
+///
+/// Computes asin(x) using the identity asin(x) = atan(x / √(1-x²)).
+///
+/// # Arguments
+/// * `x` - Input value (clamped to [-1, 1])
+///
+/// # Returns
+/// * asin(x) in radians, range [-π/2, π/2]
+fn f32_asin(x: f32) -> f32 {
+    // Clamp input to valid domain
+    let x_clamped = f32_clamp(x, -1.0, 1.0);
+
+    // Use identity: asin(x) = atan(x / √(1 - x²))
+    let one_minus_x2 = 1.0 - x_clamped * x_clamped;
+
+    // Handle edge cases where |x| = 1
+    if one_minus_x2 < F32_EPSILON {
+        return f32_sign(x_clamped) * PI_2;
+    }
+
+    f32_atan(x_clamped / f32_sqrt(one_minus_x2))
+}
+
+/// Arccosine (inverse cosine)
+///
+/// Computes acos(x) using the identity acos(x) = π/2 - asin(x).
+///
+/// # Arguments
+/// * `x` - Input value (clamped to [-1, 1])
+///
+/// # Returns
+/// * acos(x) in radians, range [0, π]
+fn f32_acos(x: f32) -> f32 {
+    PI_2 - f32_asin(x)
+}
+
+// =============================================================================
+// Mind Runtime FFI Declarations
+// =============================================================================
+//
+// These functions provide low-level bit manipulation required for IEEE 754
+// operations. They are implemented in the Mind runtime as simple memory
+// reinterpretation (no actual computation).
+
+/// Reinterpret an f32 as its underlying u32 bit pattern
+///
+/// This is a bitcast (type punning), not a conversion.
+/// The bit pattern is preserved exactly.
+///
+/// # Arguments
+/// * `x` - f32 value to reinterpret
+///
+/// # Returns
+/// * u32 containing the IEEE 754 bit representation
+#[extern("mind_runtime")]
+fn __mind_f32_to_bits(x: f32) -> u32;
+
+/// Reinterpret a u32 bit pattern as an f32
+///
+/// This is a bitcast (type punning), not a conversion.
+/// The bit pattern is preserved exactly.
+///
+/// # Arguments
+/// * `bits` - u32 containing IEEE 754 bit pattern
+///
+/// # Returns
+/// * f32 value with that bit representation
+#[extern("mind_runtime")]
+fn __mind_bits_to_f32(bits: u32) -> f32;

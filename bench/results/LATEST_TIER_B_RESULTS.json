@@ -1,0 +1,187 @@
+{
+  "tier": "B",
+  "description": "End-to-end wall clock (process start to completion)",
+  "timestamp": "2026-01-06T23:30:00",
+  "device_policy": "GPU-only",
+  "benchmark_config": {
+    "resolution": "640x360",
+    "pixels": 230400,
+    "spp": 64,
+    "bounces": 4,
+    "total_samples": 14745600,
+    "scenes": [
+      "stress_n64",
+      "stress_n128",
+      "stress_n256"
+    ]
+  },
+  "engine_status": {
+    "mindray": {
+      "status": "ready",
+      "version": "1.0",
+      "device": "NVIDIA GeForce RTX 4070 Laptop GPU"
+    },
+    "mitsuba3": {
+      "status": "ready",
+      "version": "3.7.1",
+      "variant": "cuda_ad_rgb",
+      "device": "NVIDIA GeForce RTX 4070 Laptop GPU"
+    },
+    "cycles": {
+      "status": "ready",
+      "version": "5.0",
+      "device": "NVIDIA GeForce RTX 4070 Laptop GPU (CUDA)"
+    },
+    "luxcore": {
+      "status": "ready",
+      "version": "2.8alpha1",
+      "device": "NVIDIA GeForce RTX 4070 Laptop GPU (CUDA/OptiX)",
+      "notes": "~4s fixed overhead per run (OpenCL init)"
+    },
+    "pbrt-v4": {
+      "status": "blocked",
+      "reason": "CUDA 12.8 + MSVC 19.44 + OptiX 9.1 C++20 compatibility issues"
+    },
+    "falcor": {
+      "status": "ready",
+      "version": "8.0 (eb540f6)",
+      "device": "NVIDIA GeForce RTX 4070 Laptop GPU (D3D12 DXR)"
+    }
+  },
+  "results": {
+    "mindray": {
+      "stress_n64": {
+        "wall_ms": 100.1,
+        "kernel_ms": 5.28,
+        "status": "OK"
+      },
+      "stress_n128": {
+        "wall_ms": 103.48,
+        "kernel_ms": 7.38,
+        "status": "OK"
+      },
+      "stress_n256": {
+        "wall_ms": 96.05,
+        "kernel_ms": 7.73,
+        "status": "OK"
+      }
+    },
+    "mitsuba3": {
+      "stress_n64": {
+        "wall_ms": 1424.08,
+        "render_ms": 132.19,
+        "status": "OK"
+      },
+      "stress_n128": {
+        "wall_ms": 827.24,
+        "render_ms": 154.87,
+        "status": "OK"
+      },
+      "stress_n256": {
+        "wall_ms": 973.73,
+        "render_ms": 212.43,
+        "status": "OK"
+      }
+    },
+    "cycles": {
+      "stress_n64": {
+        "wall_ms": 2043.5,
+        "internal_ms": 1104.75,
+        "status": "OK"
+      },
+      "stress_n128": {
+        "wall_ms": 2639.98,
+        "internal_ms": 1160.2,
+        "status": "OK"
+      },
+      "stress_n256": {
+        "wall_ms": 4968.41,
+        "internal_ms": 1249.37,
+        "status": "OK"
+      }
+    },
+    "luxcore": {
+      "stress_n64": {
+        "wall_ms_warm": 5040.96,
+        "wall_ms_cold": 118106.66,
+        "status": "OK",
+        "notes": "COLD includes kernel compilation (~2 min)"
+      },
+      "stress_n128": {
+        "wall_ms_warm": 5045.03,
+        "status": "OK"
+      },
+      "stress_n256": {
+        "wall_ms_warm": 5037.36,
+        "status": "OK"
+      }
+    },
+    "falcor": {
+      "stress_n64": {
+        "wall_ms": 1197.53,
+        "status": "OK"
+      },
+      "stress_n128": {
+        "wall_ms": 1198.94,
+        "status": "OK"
+      },
+      "stress_n256": {
+        "wall_ms": 1210.81,
+        "status": "OK"
+      }
+    }
+  },
+  "comparisons": {
+    "vs_mindray_wall_clock": {
+      "description": "Tier B speedup (Mind-Ray is baseline)",
+      "stress_n64": {
+        "mindray_ms": 100.1,
+        "mitsuba3_ms": 1424.08,
+        "cycles_ms": 2043.5,
+        "luxcore_ms": 5040.96,
+        "mitsuba3_slower": 14.23,
+        "cycles_slower": 20.41,
+        "luxcore_slower": 50.36,
+        "falcor_ms": 1197.53,
+        "falcor_slower": 11.96
+      },
+      "stress_n128": {
+        "mindray_ms": 103.48,
+        "mitsuba3_ms": 827.24,
+        "cycles_ms": 2639.98,
+        "luxcore_ms": 5045.03,
+        "mitsuba3_slower": 7.99,
+        "cycles_slower": 25.51,
+        "luxcore_slower": 48.76,
+        "falcor_ms": 1198.94,
+        "falcor_slower": 11.59
+      },
+      "stress_n256": {
+        "mindray_ms": 96.05,
+        "mitsuba3_ms": 973.73,
+        "cycles_ms": 4968.41,
+        "luxcore_ms": 5037.36,
+        "mitsuba3_slower": 10.14,
+        "cycles_slower": 51.73,
+        "luxcore_slower": 52.44,
+        "falcor_ms": 1210.81,
+        "falcor_slower": 12.61
+      },
+      "geomean": {
+        "mitsuba3_slower": 10.26,
+        "cycles_slower": 30.58,
+        "luxcore_slower": 50.5,
+        "falcor_slower": 12.04
+      }
+    }
+  },
+  "notes": [
+    "Tier B = end-to-end wall clock (process start to completion)",
+    "GPU-only policy: CPU-only engines excluded",
+    "LuxCore WARM uses cached kernels; COLD includes ~2min kernel compilation",
+    "Mind-Ray includes DLL load + BVH build + render + output in ~100ms",
+    "Mitsuba3 Python import overhead varies ~800ms-1400ms",
+    "Cycles startup overhead varies with scene complexity",
+    "Falcor uses D3D12 DXR for ray tracing (not CUDA)"
+  ]
+}

@@ -1,0 +1,6 @@
+﻿
+Name                          
+----                          
+Intel(R) Core(TM) Ultra 9 185H
+
+

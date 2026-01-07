@@ -1,0 +1,27 @@
+﻿=== Mind Ray CUDA Benchmark ===
+
+CUDA devices: 1
+Device 0: NVIDIA GeForce RTX 4070 Laptop GPU
+
+Config:
+  Resolution: 640x360
+  SPP: 64
+  Bounces: 4
+  Scene: stress
+  Seed: 42
+  Warmup frames: 2
+  Benchmark frames: 5
+  Spheres: 128
+SCENE_HASH=0xD92F1CBD
+
+Warmup (2 frames)...
+Benchmarking (5 frames)...
+
+=== Results ===
+Total time: 0.030 s
+Time per frame: 0.006 s
+Samples/sec: 2497.77 M
+Rays/sec: 9991.09 M
+
+Benchmark complete.
+

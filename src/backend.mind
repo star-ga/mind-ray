@@ -1,0 +1,637 @@
+// backend.mind - GPU Backend Abstraction for Mind Ray
+//
+// This module provides a unified interface for rendering via different backends:
+// - CPU: Pure Mind implementation (default, single-threaded)
+// - CUDA: NVIDIA GPU via FFI to native DLL (requires mindray_cuda.dll)
+//
+// The backend is selected at runtime via command-line argument or auto-detection.
+//
+// Usage:
+//   backend_init(BackendType::Auto, 1920, 1080)?;
+//   backend_render_frame(&config)?;
+//   backend_copy_output()?;
+//   let pixels = backend_get_output();
+//   backend_free();
+//
+// Thread Safety:
+//   WARNING: This module uses global mutable state (BACKEND_STATE) for simplicity.
+//   The backend is NOT thread-safe. Only call backend functions from a single thread.
+//   For multi-threaded rendering, use separate processes or implement per-thread state.
+//
+// Memory Safety:
+//   - All FFI calls to CUDA are wrapped with error checking
+//   - Output buffers are pre-allocated to prevent allocation failures during render
+//   - backend_free() must be called before program exit to release GPU resources
+//
+// Error Handling:
+//   All operations return BackendResult<T> with detailed error codes.
+//   Use BackendError variants to handle specific failure modes.
+//
+// Author: Mind Ray Contributors
+// License: MIT
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Maximum supported image dimension for any backend.
+pub const MAX_DIMENSION: i32 = 16384;
+
+/// Minimum supported image dimension.
+pub const MIN_DIMENSION: i32 = 1;
+
+/// Maximum samples per pixel for a single frame.
+pub const MAX_SPP_PER_FRAME: i32 = 1024;
+
+/// Maximum recursion depth for path tracing.
+pub const MAX_BOUNCES: i32 = 64;
+
+/// Default maximum bounces if not specified.
+pub const DEFAULT_MAX_BOUNCES: i32 = 8;
+
+/// Default samples per pixel.
+pub const DEFAULT_SPP: i32 = 64;
+
+/// Scene type constants matching CUDA backend.
+pub const SCENE_SPHERES: i32 = 0;
+pub const SCENE_CORNELL: i32 = 1;
+pub const SCENE_STRESS: i32 = 2;
+
+// =============================================================================
+// Error Types
+// =============================================================================
+
+/// Errors that can occur during backend operations.
+pub enum BackendError {
+    /// Backend not initialized.
+    NotInitialized,
+    /// Failed to initialize the backend.
+    InitFailed { code: i32 },
+    /// Render operation failed.
+    RenderFailed { code: i32 },
+    /// Failed to copy output from device.
+    CopyFailed { code: i32 },
+    /// Invalid parameter provided.
+    InvalidParameter { name: &str },
+    /// CUDA device not found.
+    NoDevice,
+    /// Backend already initialized.
+    AlreadyInitialized,
+    /// Memory allocation failed.
+    OutOfMemory,
+}
+
+/// Result type for backend operations.
+pub type BackendResult<T> = Result<T, BackendError>;
+
+// =============================================================================
+// Backend Type Enum
+// =============================================================================
+
+/// Available rendering backend types.
+pub enum BackendType {
+    /// Pure Mind CPU implementation.
+    Cpu,
+    /// NVIDIA CUDA GPU via FFI.
+    Cuda,
+    /// Auto-detect best available backend.
+    Auto,
+}
+
+// =============================================================================
+// Camera Configuration
+// =============================================================================
+
+/// Camera parameters for rendering.
+pub struct CameraParams {
+    /// Camera position X coordinate.
+    pub pos_x: f32,
+    /// Camera position Y coordinate.
+    pub pos_y: f32,
+    /// Camera position Z coordinate.
+    pub pos_z: f32,
+    /// Look-at target X coordinate.
+    pub look_x: f32,
+    /// Look-at target Y coordinate.
+    pub look_y: f32,
+    /// Look-at target Z coordinate.
+    pub look_z: f32,
+    /// Vertical field of view in degrees.
+    pub fov_degrees: f32,
+}
+
+impl CameraParams {
+    /// Creates default camera parameters.
+    ///
+    /// Position: (0, 2, 5), looking at (0, 1, -3), FOV: 60 degrees.
+    pub fn default() -> CameraParams {
+        CameraParams {
+            pos_x: 0.0,
+            pos_y: 2.0,
+            pos_z: 5.0,
+            look_x: 0.0,
+            look_y: 1.0,
+            look_z: -3.0,
+            fov_degrees: 60.0,
+        }
+    }
+
+    /// Validates camera parameters.
+    ///
+    /// Returns true if all parameters are valid (finite, FOV in range).
+    pub fn is_valid(&self) -> bool {
+        if !f32_is_finite(self.pos_x) || !f32_is_finite(self.pos_y) || !f32_is_finite(self.pos_z) {
+            return false;
+        }
+        if !f32_is_finite(self.look_x) || !f32_is_finite(self.look_y) || !f32_is_finite(self.look_z) {
+            return false;
+        }
+        if self.fov_degrees <= 0.0 || self.fov_degrees >= 180.0 {
+            return false;
+        }
+        true
+    }
+}
+
+// =============================================================================
+// Render Configuration
+// =============================================================================
+
+/// Configuration for a render operation.
+pub struct RenderConfig {
+    /// Image width in pixels.
+    pub width: i32,
+    /// Image height in pixels.
+    pub height: i32,
+    /// Samples per pixel for this frame.
+    pub spp: i32,
+    /// Maximum path bounces.
+    pub max_bounces: i32,
+    /// Scene type to render.
+    pub scene_type: i32,
+    /// Random seed for this frame.
+    pub seed: u32,
+    /// Camera parameters.
+    pub camera: CameraParams,
+}
+
+impl RenderConfig {
+    /// Validates render configuration.
+    ///
+    /// Returns BackendError if any parameter is invalid.
+    pub fn validate(&self) -> BackendResult<()> {
+        if self.width < MIN_DIMENSION || self.width > MAX_DIMENSION {
+            return Err(BackendError::InvalidParameter { name: "width" });
+        }
+        if self.height < MIN_DIMENSION || self.height > MAX_DIMENSION {
+            return Err(BackendError::InvalidParameter { name: "height" });
+        }
+        if self.spp < 1 || self.spp > MAX_SPP_PER_FRAME {
+            return Err(BackendError::InvalidParameter { name: "spp" });
+        }
+        if self.max_bounces < 1 || self.max_bounces > MAX_BOUNCES {
+            return Err(BackendError::InvalidParameter { name: "max_bounces" });
+        }
+        if self.scene_type < 0 || self.scene_type > 2 {
+            return Err(BackendError::InvalidParameter { name: "scene_type" });
+        }
+        if !self.camera.is_valid() {
+            return Err(BackendError::InvalidParameter { name: "camera" });
+        }
+        Ok(())
+    }
+
+    /// Creates a default render configuration.
+    pub fn default(width: i32, height: i32) -> RenderConfig {
+        RenderConfig {
+            width,
+            height,
+            spp: DEFAULT_SPP,
+            max_bounces: DEFAULT_MAX_BOUNCES,
+            scene_type: SCENE_SPHERES,
+            seed: 42,
+            camera: CameraParams::default(),
+        }
+    }
+}
+
+// =============================================================================
+// FFI Declarations for CUDA Backend
+// =============================================================================
+
+/// Opaque pointer type for raw byte buffers.
+pub type RawPtr = *mut u8;
+
+// External functions from mindray_cuda.dll
+// These are declared extern "C" and loaded at runtime.
+
+extern "C" {
+    /// Initialize CUDA backend with device and dimensions.
+    /// Returns 0 on success, negative error code on failure.
+    fn mindray_cuda_init(device_id: i32, width: i32, height: i32) -> i32;
+
+    /// Render a single frame with the given parameters.
+    /// Returns 0 on success, negative error code on failure.
+    fn mindray_cuda_render_frame(
+        spp: i32,
+        scene_type: i32,
+        max_bounces: i32,
+        seed: u32,
+        cam_x: f32,
+        cam_y: f32,
+        cam_z: f32,
+        look_x: f32,
+        look_y: f32,
+        look_z: f32,
+        fov: f32,
+    ) -> i32;
+
+    /// Copy rendered output to host buffer.
+    /// Buffer must be width * height * 3 bytes.
+    /// Returns 0 on success, negative error code on failure.
+    fn mindray_cuda_copy_output(host_buffer: RawPtr) -> i32;
+
+    /// Reset the progressive accumulator for a new render.
+    /// Returns 0 on success, negative error code on failure.
+    fn mindray_cuda_reset_accumulator() -> i32;
+
+    /// Free all CUDA resources.
+    fn mindray_cuda_free();
+
+    /// Get the last error message.
+    fn mindray_cuda_get_error() -> *const i8;
+
+    /// Get the number of available CUDA devices.
+    fn mindray_cuda_get_device_count() -> i32;
+
+    /// Get the name of a CUDA device.
+    /// Returns 0 on success, negative error code on failure.
+    fn mindray_cuda_get_device_name(device_id: i32, name_buffer: *mut i8, buffer_size: i32) -> i32;
+
+    /// Get the current accumulated frame count.
+    fn mindray_cuda_get_frame_count() -> i32;
+}
+
+// =============================================================================
+// Backend State
+// =============================================================================
+
+/// Internal state for the backend.
+///
+/// # Thread Safety
+/// This struct is NOT thread-safe. Access is guarded by the module-level
+/// functions which assume single-threaded access. Do not share across threads.
+///
+/// # Memory Layout
+/// The output_buffer is pre-allocated during init() to avoid allocation
+/// failures during rendering. Size = width * height * 3 bytes (RGB).
+pub struct BackendState {
+    /// Currently active backend type.
+    pub backend_type: BackendType,
+    /// Whether the backend is initialized.
+    pub initialized: bool,
+    /// Current image width.
+    pub width: i32,
+    /// Current image height.
+    pub height: i32,
+    /// Output buffer (width * height * 3 bytes, RGB format).
+    pub output_buffer: Vec<u8>,
+    /// CPU-specific: Accumulated frame count for progressive rendering.
+    pub cpu_frame_count: i32,
+    /// CPU-specific: Accumulation buffer for progressive rendering (Vec3 per pixel).
+    pub cpu_accumulator: Vec<f32>,
+}
+
+/// Global backend state.
+///
+/// # Safety
+/// This static mutable is intentionally single-instance for simplicity.
+/// All access must be from a single thread. The Mind runtime does not
+/// currently support thread-safe statics; use external synchronization
+/// if multi-threaded access is required.
+///
+/// # Initialization
+/// Initially None. Set by backend_init(), cleared by backend_free().
+static mut BACKEND_STATE: Option<BackendState> = None;
+
+// =============================================================================
+// Public API
+// =============================================================================
+
+/// Detect the best available backend.
+///
+/// Checks for CUDA device availability and returns CUDA if found,
+/// otherwise falls back to CPU.
+pub fn detect_backend() -> BackendType {
+    unsafe {
+        let device_count = mindray_cuda_get_device_count();
+        if device_count > 0 {
+            BackendType::Cuda
+        } else {
+            BackendType::Cpu
+        }
+    }
+}
+
+/// Initialize the rendering backend.
+///
+/// # Arguments
+/// * `backend_type` - The backend to use (Cpu, Cuda, or Auto)
+/// * `width` - Image width in pixels
+/// * `height` - Image height in pixels
+///
+/// # Returns
+/// * `Ok(())` on success
+/// * `Err(BackendError)` on failure
+pub fn backend_init(backend_type: BackendType, width: i32, height: i32) -> BackendResult<()> {
+    // Validate dimensions
+    if width < MIN_DIMENSION || width > MAX_DIMENSION {
+        return Err(BackendError::InvalidParameter { name: "width" });
+    }
+    if height < MIN_DIMENSION || height > MAX_DIMENSION {
+        return Err(BackendError::InvalidParameter { name: "height" });
+    }
+
+    // Check for overflow in buffer allocation
+    let pixel_count = width as i64 * height as i64;
+    let buffer_size = pixel_count * 3;
+    if buffer_size > i32::MAX as i64 {
+        return Err(BackendError::OutOfMemory);
+    }
+
+    unsafe {
+        if BACKEND_STATE.is_some() {
+            return Err(BackendError::AlreadyInitialized);
+        }
+
+        let actual_type = match backend_type {
+            BackendType::Auto => detect_backend(),
+            other => other,
+        };
+
+        match actual_type {
+            BackendType::Cuda => {
+                let result = mindray_cuda_init(0, width, height);
+                if result != 0 {
+                    return Err(BackendError::InitFailed { code: result });
+                }
+            }
+            BackendType::Cpu => {
+                // CPU backend requires no special initialization
+            }
+            BackendType::Auto => unreachable!(),
+        }
+
+        let output_buffer = vec![0u8; buffer_size as usize];
+
+        // CPU backend needs accumulator for progressive rendering
+        // 3 floats per pixel (RGB) for high-precision accumulation
+        let accumulator_size = pixel_count * 3;
+        let cpu_accumulator = vec![0.0f32; accumulator_size as usize];
+
+        BACKEND_STATE = Some(BackendState {
+            backend_type: actual_type,
+            initialized: true,
+            width,
+            height,
+            output_buffer,
+            cpu_frame_count: 0,
+            cpu_accumulator,
+        });
+
+        Ok(())
+    }
+}
+
+/// Render a frame with the given configuration.
+///
+/// The output is accumulated progressively. Call `backend_reset()` to start fresh.
+///
+/// # Arguments
+/// * `config` - Render configuration including SPP, scene, camera
+///
+/// # Returns
+/// * `Ok(())` on success
+/// * `Err(BackendError)` on failure
+pub fn backend_render_frame(config: &RenderConfig) -> BackendResult<()> {
+    config.validate()?;
+
+    unsafe {
+        let state = match &mut BACKEND_STATE {
+            Some(s) => s,
+            None => return Err(BackendError::NotInitialized),
+        };
+
+        if !state.initialized {
+            return Err(BackendError::NotInitialized);
+        }
+
+        match state.backend_type {
+            BackendType::Cuda => {
+                let result = mindray_cuda_render_frame(
+                    config.spp,
+                    config.scene_type,
+                    config.max_bounces,
+                    config.seed,
+                    config.camera.pos_x,
+                    config.camera.pos_y,
+                    config.camera.pos_z,
+                    config.camera.look_x,
+                    config.camera.look_y,
+                    config.camera.look_z,
+                    config.camera.fov_degrees,
+                );
+                if result != 0 {
+                    return Err(BackendError::RenderFailed { code: result });
+                }
+            }
+            BackendType::Cpu => {
+                // CPU rendering implementation
+                //
+                // Integration Note:
+                // For full path tracing, this function should:
+                // 1. Create a Camera from config.camera
+                // 2. Build a Scene from config.scene_type
+                // 3. Call render_pixel for each (x,y) coordinate
+                // 4. Accumulate results in cpu_accumulator
+                // 5. Convert to u8 in output_buffer on copy_output
+                //
+                // Current Implementation:
+                // Increments frame count for progressive rendering tracking.
+                // The actual pixel rendering is performed by the main.mind
+                // render loop which calls render.mind directly.
+                //
+                // This separation allows the backend module to focus on
+                // GPU abstraction while main.mind handles CPU rendering.
+                state.cpu_frame_count += 1;
+
+                // Note: For a fully integrated backend, uncomment and implement:
+                // cpu_render_frame(state, config);
+            }
+            BackendType::Auto => unreachable!(),
+        }
+
+        Ok(())
+    }
+}
+
+/// Copy the rendered output to the internal buffer.
+///
+/// After calling this, use `backend_get_output()` to access the pixels.
+///
+/// # Returns
+/// * `Ok(())` on success
+/// * `Err(BackendError)` on failure
+pub fn backend_copy_output() -> BackendResult<()> {
+    unsafe {
+        let state = match &mut BACKEND_STATE {
+            Some(s) => s,
+            None => return Err(BackendError::NotInitialized),
+        };
+
+        match state.backend_type {
+            BackendType::Cuda => {
+                let result = mindray_cuda_copy_output(state.output_buffer.as_mut_ptr());
+                if result != 0 {
+                    return Err(BackendError::CopyFailed { code: result });
+                }
+            }
+            BackendType::Cpu => {
+                // CPU output is already in the buffer
+            }
+            BackendType::Auto => unreachable!(),
+        }
+
+        Ok(())
+    }
+}
+
+/// Get a reference to the output buffer.
+///
+/// The buffer contains RGB data, width * height * 3 bytes.
+/// Returns None if backend is not initialized.
+pub fn backend_get_output() -> Option<&'static [u8]> {
+    unsafe {
+        match &BACKEND_STATE {
+            Some(s) => Some(&s.output_buffer),
+            None => None,
+        }
+    }
+}
+
+/// Reset the progressive accumulator for a new render.
+///
+/// # Returns
+/// * `Ok(())` on success
+/// * `Err(BackendError)` on failure
+pub fn backend_reset() -> BackendResult<()> {
+    unsafe {
+        let state = match &BACKEND_STATE {
+            Some(s) => s,
+            None => return Err(BackendError::NotInitialized),
+        };
+
+        match state.backend_type {
+            BackendType::Cuda => {
+                let result = mindray_cuda_reset_accumulator();
+                if result != 0 {
+                    return Err(BackendError::RenderFailed { code: result });
+                }
+            }
+            BackendType::Cpu => {
+                // CPU accumulator reset - continue to post-match handling
+            }
+            BackendType::Auto => unreachable!(),
+        }
+
+        // CPU-specific reset (done outside match to avoid borrow conflict)
+        if let Some(state) = &mut BACKEND_STATE {
+            if matches!(state.backend_type, BackendType::Cpu) {
+                state.cpu_frame_count = 0;
+                // Zero out the accumulator buffer
+                for i in 0..state.cpu_accumulator.len() {
+                    state.cpu_accumulator[i] = 0.0;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Free all backend resources.
+///
+/// After calling this, the backend must be re-initialized before use.
+pub fn backend_free() {
+    unsafe {
+        if let Some(state) = &BACKEND_STATE {
+            match state.backend_type {
+                BackendType::Cuda => {
+                    mindray_cuda_free();
+                }
+                BackendType::Cpu => {
+                    // No special cleanup needed
+                }
+                BackendType::Auto => {}
+            }
+        }
+        BACKEND_STATE = None;
+    }
+}
+
+/// Get the current frame count (for progressive rendering).
+///
+/// For progressive rendering, each frame's samples are accumulated.
+/// The frame count indicates how many frames have been accumulated.
+///
+/// # Returns
+/// * Current accumulated frame count
+/// * 0 if backend is not initialized
+pub fn backend_get_frame_count() -> i32 {
+    unsafe {
+        match &BACKEND_STATE {
+            Some(state) => match state.backend_type {
+                BackendType::Cuda => mindray_cuda_get_frame_count(),
+                BackendType::Cpu => state.cpu_frame_count,
+                BackendType::Auto => 0,
+            },
+            None => 0,
+        }
+    }
+}
+
+/// Get information about available CUDA devices.
+///
+/// Returns a vector of device names, or empty if no CUDA devices.
+pub fn get_cuda_devices() -> Vec<String> {
+    unsafe {
+        let count = mindray_cuda_get_device_count();
+        let mut devices = Vec::new();
+
+        for i in 0..count {
+            let mut name_buffer = [0i8; 256];
+            if mindray_cuda_get_device_name(i, name_buffer.as_mut_ptr(), 256) == 0 {
+                // Convert C string to Mind string
+                let mut name = String::new();
+                for c in &name_buffer {
+                    if *c == 0 {
+                        break;
+                    }
+                    name.push(*c as u8 as char);
+                }
+                devices.push(name);
+            }
+        }
+
+        devices
+    }
+}
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+/// Check if a float is finite (not NaN or infinity).
+fn f32_is_finite(x: f32) -> bool {
+    x.is_finite()
+}

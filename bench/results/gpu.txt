@@ -1,0 +1,1 @@
+﻿GPU 0: NVIDIA GeForce RTX 4070 Laptop GPU (UUID: GPU-d6aa8c35-6af7-610f-24c7-12f6b9e87c4e)

@@ -1,0 +1,466 @@
+// io.mind - Image output (PPM format)
+//
+// Provides file I/O operations for the Mind Ray path tracer.
+// Implements binary PPM (P6) format output with comprehensive error handling.
+//
+// PPM Format Specification (P6 Binary):
+//   - Header: "P6\n<width> <height>\n<max_value>\n"
+//   - Body: width * height RGB triplets (3 bytes each)
+//   - Pixels stored in row-major order, top-to-bottom, left-to-right
+//
+// Thread Safety: File operations are NOT thread-safe. Each thread should
+// use its own file handles for concurrent I/O.
+
+// =============================================================================
+// Result and Error Types
+// =============================================================================
+
+/// Result type for I/O operations following Rust conventions
+enum IoResult<T> {
+    Ok(T),
+    Err(IoError),
+}
+
+/// Comprehensive I/O error types with descriptive variants
+enum IoError {
+    /// File does not exist at specified path
+    FileNotFound,
+    /// Insufficient permissions to access file
+    PermissionDenied,
+    /// Path is empty, malformed, or contains invalid characters
+    InvalidPath,
+    /// Write operation failed (disk full, I/O error, etc.)
+    WriteError,
+    /// Image dimensions are invalid (zero, negative, or mismatched)
+    InvalidDimensions,
+    /// Pixel array is null or uninitialized
+    NullPixelData,
+    /// File handle is invalid or already closed
+    InvalidHandle,
+    /// Unexpected end of file during read
+    UnexpectedEof,
+}
+
+// =============================================================================
+// File Handle
+// =============================================================================
+
+/// File handle wrapper with validity tracking and RAII-style cleanup
+struct File {
+    /// Platform-specific file handle (-1 indicates invalid)
+    handle: i64,
+    /// Whether the file is currently open and valid
+    is_open: bool,
+    /// Original path used to open the file (for error reporting)
+    path: str,
+}
+
+/// Invalid file handle sentinel value
+const INVALID_HANDLE: i64 = -1;
+
+// =============================================================================
+// PPM Constants
+// =============================================================================
+
+/// Maximum color component value (8-bit depth)
+const PPM_MAX_VALUE: i32 = 255;
+
+/// PPM binary format magic number
+const PPM_HEADER_FORMAT: str = "P6";
+
+/// Minimum valid image dimension
+const MIN_DIMENSION: i32 = 1;
+
+/// Maximum valid image dimension (prevents integer overflow)
+const MAX_DIMENSION: i32 = 65536;
+
+// =============================================================================
+// Public API - PPM Writing
+// =============================================================================
+
+/// Write image data to a PPM file (binary P6 format)
+///
+/// Creates a binary PPM file from an array of floating-point RGB colors.
+/// Performs comprehensive input validation before writing.
+///
+/// # Arguments
+/// * `filename` - Output file path (must be non-empty)
+/// * `width` - Image width in pixels (must be in [1, 65536])
+/// * `height` - Image height in pixels (must be in [1, 65536])
+/// * `pixels` - Array of Vec3 color values (RGB, each component in [0.0, 1.0])
+///              Length must equal width * height
+///
+/// # Returns
+/// * `IoResult<()>` - Ok(()) on success, Err(IoError) on failure
+///
+/// # Errors
+/// * `InvalidPath` - filename is empty
+/// * `InvalidDimensions` - width/height out of range or pixel array size mismatch
+/// * `FileNotFound` - unable to create/open file at path
+/// * `WriteError` - I/O error during write operation
+///
+/// # Example
+/// ```mind
+/// let pixels = render_scene(width, height);
+/// match write_ppm("output.ppm", width, height, pixels) {
+///     IoResult::Ok(()) => println("Image saved successfully"),
+///     IoResult::Err(e) => println("Failed to save image"),
+/// }
+/// ```
+fn write_ppm(filename: str, width: i32, height: i32, pixels: &[Vec3]) -> IoResult<()> {
+    // Validate filename
+    if filename.len() == 0 {
+        return IoResult::Err(IoError::InvalidPath);
+    }
+
+    // Validate dimensions are within acceptable range
+    if width < MIN_DIMENSION || width > MAX_DIMENSION {
+        return IoResult::Err(IoError::InvalidDimensions);
+    }
+    if height < MIN_DIMENSION || height > MAX_DIMENSION {
+        return IoResult::Err(IoError::InvalidDimensions);
+    }
+
+    // Validate pixel array length matches dimensions
+    // Use i64 to prevent overflow: width * height could overflow i32
+    let expected_len = (width as i64) * (height as i64);
+    if pixels.len() as i64 != expected_len {
+        return IoResult::Err(IoError::InvalidDimensions);
+    }
+
+    // Open file for writing (binary mode)
+    let file = file_open(filename, "wb");
+    if !file.is_open {
+        return IoResult::Err(IoError::FileNotFound);
+    }
+
+    // Write PPM header: "P6\n<width> <height>\n255\n"
+    let header = format_ppm_header(width, height, PPM_MAX_VALUE);
+    if !file_write_string(&file, header) {
+        file_close(&file);
+        return IoResult::Err(IoError::WriteError);
+    }
+
+    // Write pixel data row by row (top to bottom, left to right)
+    // PPM stores pixels in row-major order
+    for y in 0..height {
+        for x in 0..width {
+            let idx = (y * width + x) as usize;
+            let color = pixels[idx];
+
+            // Convert float [0.0, 1.0] to byte [0, 255]
+            // float_to_byte handles clamping and rounding
+            let r_byte = float_to_byte(color.x);
+            let g_byte = float_to_byte(color.y);
+            let b_byte = float_to_byte(color.z);
+
+            // Write RGB triplet - each component is one byte
+            if !file_write_byte(&file, r_byte) {
+                file_close(&file);
+                return IoResult::Err(IoError::WriteError);
+            }
+            if !file_write_byte(&file, g_byte) {
+                file_close(&file);
+                return IoResult::Err(IoError::WriteError);
+            }
+            if !file_write_byte(&file, b_byte) {
+                file_close(&file);
+                return IoResult::Err(IoError::WriteError);
+            }
+        }
+    }
+
+    // Close file and return success
+    file_close(&file);
+    IoResult::Ok(())
+}
+
+// =============================================================================
+// Color Conversion Utilities
+// =============================================================================
+
+/// Convert a floating-point color component [0.0, 1.0] to a byte [0, 255]
+///
+/// Performs proper clamping and rounding for accurate color representation.
+/// Values outside [0.0, 1.0] are clamped to prevent overflow/underflow.
+///
+/// # Arguments
+/// * `value` - Color component in floating-point range
+///
+/// # Returns
+/// * Byte value in [0, 255] range
+///
+/// # Algorithm
+/// 1. Clamp input to [0.0, 1.0]
+/// 2. Scale by 255
+/// 3. Add 0.5 for rounding (truncation after +0.5 = round to nearest)
+/// 4. Clamp final integer to [0, 255] as safety measure
+#[inline]
+fn float_to_byte(value: f32) -> u8 {
+    // Clamp to valid range [0.0, 1.0]
+    let clamped = f32_clamp(value, 0.0, 1.0);
+    // Scale to [0, 255] and add 0.5 for rounding
+    let scaled = clamped * 255.0 + 0.5;
+    // Convert to integer with final safety clamp
+    i32_clamp(scaled as i32, 0, 255) as u8
+}
+
+/// Convert a byte [0, 255] back to floating-point [0.0, 1.0]
+///
+/// Inverse of float_to_byte. Useful for reading PPM files.
+///
+/// # Arguments
+/// * `byte` - Color component as byte
+///
+/// # Returns
+/// * Floating-point value in [0.0, 1.0] range
+#[inline]
+fn byte_to_float(byte: u8) -> f32 {
+    (byte as f32) / 255.0
+}
+
+/// Clamp an f32 value to a range [min, max]
+///
+/// # Arguments
+/// * `x` - Value to clamp
+/// * `min` - Minimum bound (inclusive)
+/// * `max` - Maximum bound (inclusive)
+///
+/// # Returns
+/// * x clamped to [min, max]
+#[inline]
+fn f32_clamp(x: f32, min: f32, max: f32) -> f32 {
+    if x < min { min } else if x > max { max } else { x }
+}
+
+/// Clamp an i32 value to a range [min, max]
+///
+/// # Arguments
+/// * `x` - Value to clamp
+/// * `min` - Minimum bound (inclusive)
+/// * `max` - Maximum bound (inclusive)
+///
+/// # Returns
+/// * x clamped to [min, max]
+#[inline]
+fn i32_clamp(x: i32, min: i32, max: i32) -> i32 {
+    if x < min { min } else if x > max { max } else { x }
+}
+
+// =============================================================================
+// PPM Header Formatting
+// =============================================================================
+
+/// Format PPM header string according to P6 binary specification
+///
+/// # Arguments
+/// * `width` - Image width in pixels
+/// * `height` - Image height in pixels
+/// * `max_value` - Maximum color component value (typically 255)
+///
+/// # Returns
+/// * Formatted header string: "P6\n<width> <height>\n<max_value>\n"
+fn format_ppm_header(width: i32, height: i32, max_value: i32) -> str {
+    // PPM P6 header format: "P6\n<width> <height>\n<max_value>\n"
+    // Each field separated by whitespace (newlines used for clarity)
+    format("{}\n{} {}\n{}\n", PPM_HEADER_FORMAT, width, height, max_value)
+}
+
+// =============================================================================
+// Platform-specific File I/O Implementation
+// =============================================================================
+//
+// These functions interface with the Mind runtime's I/O subsystem.
+// The runtime handles platform-specific details (Windows/Linux/macOS).
+// All file operations use the C standard library under the hood.
+
+/// Open a file with the specified mode
+///
+/// Creates a File handle for reading or writing. The caller is responsible
+/// for closing the file when done using file_close().
+///
+/// # Arguments
+/// * `path` - File path (absolute or relative to current working directory)
+/// * `mode` - File mode string:
+///   - "r"  - Open for reading (text mode)
+///   - "w"  - Open for writing, truncate if exists (text mode)
+///   - "rb" - Open for reading (binary mode)
+///   - "wb" - Open for writing, truncate if exists (binary mode)
+///   - "a"  - Open for appending
+///   - "ab" - Open for appending (binary mode)
+///
+/// # Returns
+/// * `File` - File handle with is_open indicating success/failure
+///
+/// # Example
+/// ```mind
+/// let file = file_open("output.ppm", "wb");
+/// if file.is_open {
+///     // ... write to file ...
+///     file_close(&file);
+/// }
+/// ```
+fn file_open(path: str, mode: str) -> File {
+    // Validate inputs
+    if path.len() == 0 || mode.len() == 0 {
+        return File {
+            handle: INVALID_HANDLE,
+            is_open: false,
+            path: path,
+        };
+    }
+
+    // Call into Mind runtime for actual file opening
+    let handle = __mind_file_open(path, mode);
+
+    File {
+        handle: handle,
+        is_open: handle != INVALID_HANDLE,
+        path: path,
+    }
+}
+
+/// Check if a file handle is valid and open
+///
+/// # Arguments
+/// * `f` - Reference to File struct
+///
+/// # Returns
+/// * true if file is open and handle is valid
+#[inline]
+fn file_is_valid(f: &File) -> bool {
+    f.is_open && f.handle != INVALID_HANDLE
+}
+
+/// Write a string to a file
+///
+/// Writes all bytes of the string to the file. Does not add trailing newline.
+///
+/// # Arguments
+/// * `f` - Reference to open File
+/// * `s` - String to write
+///
+/// # Returns
+/// * true on success, false on failure or invalid file handle
+fn file_write_string(f: &File, s: str) -> bool {
+    if !file_is_valid(f) {
+        return false;
+    }
+    __mind_file_write_string(f.handle, s) >= 0
+}
+
+/// Write a single byte to a file
+///
+/// # Arguments
+/// * `f` - Reference to open File
+/// * `b` - Byte to write
+///
+/// # Returns
+/// * true on success, false on failure or invalid file handle
+fn file_write_byte(f: &File, b: u8) -> bool {
+    if !file_is_valid(f) {
+        return false;
+    }
+    __mind_file_write_byte(f.handle, b) >= 0
+}
+
+/// Close a file handle
+///
+/// Releases system resources associated with the file.
+/// Safe to call on already-closed or invalid handles (no-op).
+///
+/// # Arguments
+/// * `f` - Reference to File struct
+fn file_close(f: &File) {
+    if f.is_open && f.handle != INVALID_HANDLE {
+        __mind_file_close(f.handle);
+    }
+}
+
+/// Format a string with arguments (printf-style formatting)
+///
+/// Supports format specifiers:
+/// - {} - Auto-format based on argument type
+/// - {:d} - Integer (decimal)
+/// - {:x} - Integer (hexadecimal)
+/// - {:f} - Floating point
+/// - {:s} - String
+///
+/// # Arguments
+/// * `template` - Format string with {} placeholders
+/// * `args` - Variable arguments matching placeholders
+///
+/// # Returns
+/// * Formatted string
+fn format(template: str, args: ...) -> str {
+    __mind_format(template, args)
+}
+
+// =============================================================================
+// Mind Runtime FFI Declarations
+// =============================================================================
+//
+// These functions are implemented by the Mind runtime in native code (C/Rust).
+// They provide low-level access to the operating system's file I/O facilities.
+// The FFI boundary uses the "mind_runtime" calling convention which handles
+// automatic type marshalling between Mind and native code.
+//
+// Return values:
+// - File handles: -1 (INVALID_HANDLE) indicates failure
+// - Write operations: -1 indicates failure, >= 0 indicates success
+//
+// Error handling is done via return values rather than exceptions.
+
+/// Open a file at the specified path with the given mode
+///
+/// # Arguments
+/// * `path` - Null-terminated file path string
+/// * `mode` - Null-terminated mode string ("r", "w", "rb", "wb", etc.)
+///
+/// # Returns
+/// * Platform-specific file handle, or -1 on failure
+#[extern("mind_runtime")]
+fn __mind_file_open(path: str, mode: str) -> i64;
+
+/// Write a string to an open file
+///
+/// # Arguments
+/// * `handle` - Valid file handle from __mind_file_open
+/// * `data` - Null-terminated string to write
+///
+/// # Returns
+/// * Number of bytes written on success, -1 on failure
+#[extern("mind_runtime")]
+fn __mind_file_write_string(handle: i64, data: str) -> i32;
+
+/// Write a single byte to an open file
+///
+/// # Arguments
+/// * `handle` - Valid file handle from __mind_file_open
+/// * `byte` - Byte value to write
+///
+/// # Returns
+/// * 0 on success, -1 on failure
+#[extern("mind_runtime")]
+fn __mind_file_write_byte(handle: i64, byte: u8) -> i32;
+
+/// Close an open file handle
+///
+/// Releases all system resources associated with the file.
+/// Safe to call with invalid handle (no-op).
+///
+/// # Arguments
+/// * `handle` - File handle to close
+#[extern("mind_runtime")]
+fn __mind_file_close(handle: i64);
+
+/// Format a string with variable arguments (printf-style)
+///
+/// # Arguments
+/// * `template` - Format string with {} placeholders
+/// * `args` - Variadic arguments matching placeholders
+///
+/// # Returns
+/// * Newly allocated formatted string
+#[extern("mind_runtime")]
+fn __mind_format(template: str, args: ...) -> str;

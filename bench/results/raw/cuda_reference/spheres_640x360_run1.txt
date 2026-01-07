@@ -1,0 +1,18 @@
+﻿=== CUDA Reference Benchmark (Internal CUDA Event Timing) ===
+
+Executable: C:\Users\Admin\projects\mind-ray\bench\bin\cuda_reference.exe
+Args: --w 640 --h 360 --spp 64 --frames 5 --bounces 4 --scene spheres
+
+--- Program Output ---
+KERNEL_MS_TOTAL=26.270
+KERNEL_MS_PER_FRAME=5.254
+KERNEL_SAMPLES_PER_SEC=2806.580
+KERNEL_CONFIG width=640 height=360 spp=64 frames=5 bounces=4 seed=0xA341316C scene=spheres
+Wrote C:\Users\Admin\projects\mind-ray\bench\bin\cuda_ref_out.ppm (640x360, spp=64, frames=5)
+
+--- Parsed Kernel Timing ---
+KERNEL_MS_TOTAL: 26.27 ms
+KERNEL_MS_PER_FRAME: 5.254 ms
+KERNEL_SAMPLES_PER_SEC: 2806.58 M
+
+Note: Timing is kernel-only via CUDA events (excludes file I/O)
