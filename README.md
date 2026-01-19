@@ -113,9 +113,9 @@ See [`bench/contract_v2.md`](bench/contract_v2.md) for full tier definitions.
 <!-- AUTO_ENGINE_MATRIX_START -->
 | Engine | Tier | Device | Status | Source |
 |--------|------|--------|--------|--------|
-| Mind-Ray CUDA | A | GPU | Ready | [This repo](https://github.com/cputer/mind-ray) |
-| Mind-Ray Tier B | B | GPU | Ready | [This repo](https://github.com/cputer/mind-ray) |
-| Mind-Ray Tier BP | BP | GPU | Ready | [This repo](https://github.com/cputer/mind-ray) |
+| Mind-Ray CUDA | A | GPU | Ready | [This repo](https://github.com/star-ga/mind-ray) |
+| Mind-Ray Tier B | B | GPU | Ready | [This repo](https://github.com/star-ga/mind-ray) |
+| Mind-Ray Tier BP | BP | GPU | Ready | [This repo](https://github.com/star-ga/mind-ray) |
 | Mitsuba 3 | B, BP | GPU | Ready | [Link](https://github.com/mitsuba-renderer/mitsuba3) |
 | Blender Cycles | B | GPU | Ready | [Link](https://www.blender.org/download/) |
 | NVIDIA Falcor | B | GPU | Ready | [Link](https://github.com/NVIDIAGameWorks/Falcor) |
@@ -170,7 +170,7 @@ MIT - see [LICENSE](LICENSE).
 
 ## Built on MIND
 
-Mind-Ray's CPU renderer is written in [**MIND**](https://github.com/cputer/mind), a systems programming language designed for AI/ML and numerical computing. MIND provides:
+Mind-Ray's CPU renderer is written in [**MIND**](https://github.com/star-ga/mind), a systems programming language designed for AI/ML and numerical computing. MIND provides:
 
 - Static tensor types with compile-time shape checking
 - MLIR/LLVM backend for optimized code generation

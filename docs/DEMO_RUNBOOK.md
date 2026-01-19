@@ -13,7 +13,7 @@ Step-by-step commands to demonstrate Mind Ray CUDA performance.
 
 ```powershell
 # 1. Clone repository
-git clone https://github.com/cputer/mind-ray.git
+git clone https://github.com/star-ga/mind-ray.git
 cd mind-ray
 
 # 2. Build BVH-accelerated CUDA kernel

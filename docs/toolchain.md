@@ -42,7 +42,7 @@ Mind Ray requires the following tools:
 
 1. **Mind Compiler (mindc)**
    - Compiles `.mind` source files to executable binaries
-   - Version: Latest from [github.com/cputer/mind](https://github.com/cputer/mind)
+   - Version: Latest from [github.com/star-ga/mind](https://github.com/star-ga/mind)
    - Install via: `scripts/get_mindc.*` or build from source
 
 2. **Rust/Cargo** (for building Mind from source)
@@ -85,7 +85,7 @@ This installs `mindc` to `./toolchain/mindc` (or `mindc.exe` on Windows).
 
 **Step 1: Clone Mind Repository**
 ```bash
-git clone https://github.com/cputer/mind.git
+git clone https://github.com/star-ga/mind.git
 cd mind
 ```
 
@@ -305,7 +305,7 @@ steps:
 
 ## Additional Resources
 
-- **Mind Language**: [github.com/cputer/mind](https://github.com/cputer/mind)
-- **Mind Specification**: [github.com/cputer/mind-spec](https://github.com/cputer/mind-spec)
-- **Mind Runtime**: [github.com/cputer/mind-runtime](https://github.com/cputer/mind-runtime)
-- **Mind Ray Issues**: [github.com/cputer/mind-ray/issues](https://github.com/cputer/mind-ray/issues)
+- **Mind Language**: [github.com/star-ga/mind](https://github.com/star-ga/mind)
+- **Mind Specification**: [github.com/star-ga/mind-spec](https://github.com/star-ga/mind-spec)
+- **Mind Runtime**: [github.com/star-ga/mind-runtime](https://github.com/star-ga/mind-runtime)
+- **Mind Ray Issues**: [github.com/star-ga/mind-ray/issues](https://github.com/star-ga/mind-ray/issues)
