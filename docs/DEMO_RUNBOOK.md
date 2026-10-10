@@ -6,8 +6,8 @@ Step-by-step commands to demonstrate Mind Ray CUDA performance.
 
 - Windows 10/11
 - NVIDIA GPU (RTX 20-series or newer recommended)
-- CUDA Toolkit 12.x
-- Visual Studio 2022
+- CUDA Toolkit 12.8 or newer (CI compiles with 13.4)
+- Visual Studio Build Tools (MSVC x64)
 
 ## Demo Commands (6 steps)
 

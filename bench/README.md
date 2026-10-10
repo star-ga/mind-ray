@@ -67,8 +67,8 @@ To reproduce benchmark results:
 
 ## Toolchain Requirements
 
-- **CUDA Toolkit**: 12.x
-- **Visual Studio**: 2022 (for cl.exe)
+- **CUDA Toolkit**: 12.8 or newer (results were recorded with 12.8; CI compiles with 13.4)
+- **Visual Studio**: Build Tools with the MSVC x64 toolset (for cl.exe)
 - **GPU**: NVIDIA with CUDA support
 
 ## Methodology

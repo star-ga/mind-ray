@@ -1,35 +1,40 @@
-# Mind Ray Benchmarking & Performance Comparisons
+# MIND-Ray Benchmarking & Performance Comparisons
 
-This document describes how to benchmark Mind Ray and compare it against other ray tracers.
+This document describes how to benchmark the MIND CPU renderer and compare it
+against other ray tracers. The GPU benchmark tiers for the CUDA kernel are
+described in [`../BENCHMARK.md`](../BENCHMARK.md) and
+[`../bench/README.md`](../bench/README.md).
 
-## Running Mind Ray Benchmarks
+## Running MIND CPU Renderer Benchmarks
 
 ### Quick Benchmark
 
 ```bash
-# Windows
-.\bench\run_bench.ps1
-
-# Linux/macOS
+# Linux/macOS (build first with ./scripts/build.sh)
 ./bench/run_bench.sh
+
+# Windows (build first with .\scripts\build.ps1)
+.\bench\run_bench.ps1
 ```
 
-This runs the standard benchmark suite with three scenes:
-- **sanity**: 640x360, 64 spp, 2 bounces (quick validation)
-- **cornell**: 640x360, 128 spp, 4 bounces (quality reference)
-- **stress**: 640x360, 16 spp, 2 bounces (geometry stress test)
+This times three renders and prints the wall-clock time and image hash of each:
+- **sanity**: spheres, 640x360, 64 spp, 2 bounces
+- **cornell**: 640x360, 128 spp, 4 bounces
+- **stress**: 640x360, 16 spp, 2 bounces
 
 ### Custom Benchmarks
 
+The renderer reads `<scene> <width> <height> <spp> <bounces> <seed>` from stdin:
+
 ```bash
 # High-resolution render
-.\bin\mind-ray.exe --scene cornell --width 1920 --height 1080 --spp 256 --bounces 8
+time (echo "cornell 1920 1080 256 8 42" | ./target/release/mind-ray > out/cornell_hd.ppm)
 
 # Quick iteration test
-.\bin\mind-ray.exe --scene spheres --width 512 --height 512 --spp 4 --bounces 2
+time (echo "spheres 512 512 4 2 42" | ./target/release/mind-ray > out/quick.ppm)
 
-# Deterministic comparison
-.\bin\mind-ray.exe --scene cornell --seed 42 --out test.ppm
+# Deterministic comparison: the fnv1a32 value on stderr must match across runs
+echo "cornell 320 180 16 4 42" | ./target/release/mind-ray > out/test.ppm
 ```
 
 ## Metrics Explained
@@ -52,7 +57,7 @@ samples_per_sec = total_samples / render_time
 
 ### Important Notes
 - Benchmarks exclude compilation time and startup overhead
-- Use same seed (--seed 42) for reproducible comparisons
+- Use the same seed (last stdin field) for reproducible comparisons
 - Ensure no other heavy processes are running
 - GPU benchmarks should report GPU model and driver version
 - CPU benchmarks should report CPU model and thread count
@@ -158,52 +163,53 @@ Use `bench/results_template.md` to record your findings. Example:
 
 ```markdown
 ## System Information
-- CPU: AMD Ryzen 9 5950X (16c/32t)
-- GPU: NVIDIA RTX 3080 (10GB)
-- RAM: 64GB DDR4-3600
-- OS: Windows 11
+- CPU: <model> (<cores>c/<threads>t)
+- GPU: <model> (<VRAM>)
+- RAM: <size>
+- OS: <name and version>
+- mindc: <version>
 
-## Mind Ray Results (CPU)
-| Scene   | Res     | SPP | Bounces | Time  | Rays/sec | Samples/sec |
-|---------|---------|-----|---------|-------|----------|-------------|
-| cornell | 640x360 | 128 | 4       | 12.4s | 96M      | 24M         |
+## MIND-Ray Results (CPU)
+| Scene   | Res     | SPP | Bounces | Time   | Rays/sec | Samples/sec |
+|---------|---------|-----|---------|--------|----------|-------------|
+| cornell | 640x360 | 128 | 4       | <time> | <value>  | <value>     |
 
-## tinypt (CUDA)
-| Scene   | Res     | SPP | Bounces | Time  | Rays/sec | Samples/sec |
-|---------|---------|-----|---------|-------|----------|-------------|
-| cornell | 640x360 | 128 | 4       | 0.8s  | 1.5B     | 375M        |
+## <other renderer>
+| Scene   | Res     | SPP | Bounces | Time   | Rays/sec | Samples/sec |
+|---------|---------|-----|---------|--------|----------|-------------|
+| cornell | 640x360 | 128 | 4       | <time> | <value>  | <value>     |
 ```
 
-## What Mind Ray Proves
+## What the MIND Renderer Shows
 
 ### Current Capabilities ✅
 
-1. **Language Viability**: Mind can express complex graphics algorithms clearly
+1. **Language Viability**: the executable subset of MIND v0.10.2 expresses a complete path tracer
 2. **Correctness**: Produces physically plausible images with proper global illumination
-3. **Determinism**: Bit-exact reproducibility via seeded RNG
-4. **Modularity**: Clean separation of concerns (math, materials, scenes, rendering)
-5. **Cross-Platform**: Same source builds on Windows, Linux, macOS
+3. **Determinism**: identical image hashes run to run on the same toolchain (checked by `scripts/test.sh`)
+4. **Single module**: one file today; the earlier modular layout is in `archive/mind-pre-0.10/`
+5. **Platforms**: built and tested on x86-64 Linux; other platforms need `mindc` plus the MLIR tools
 
 ### Performance Positioning 📊
 
-- **CPU Performance**: Competitive with other single-threaded CPU path tracers
-- **GPU Potential**: Architecture ready for GPU backend via Mind runtime
+- **CPU Performance**: not yet measured against other CPU path tracers
+- **GPU**: the GPU renderer is the separate CUDA kernel in `native-cuda/`
 - **Scalability**: Linear scaling with scene complexity (no BVH yet)
 
 ### Educational Value 📚
 
 - **Readable**: Clear implementation of path tracing concepts
 - **Hackable**: Easy to modify materials, scenes, and rendering algorithm
-- **Complete**: End-to-end example from CLI to image output
+- **Complete**: End-to-end example from configuration to image output
 
-## What Mind Ray Doesn't Prove Yet
+## What the MIND Renderer Does Not Show Yet
 
 ### Missing Features 🚧
 
 1. **Acceleration Structures**: No BVH/octree (O(n) per ray)
 2. **Triangle Meshes**: Only spheres and rects, no arbitrary geometry
 3. **Importance Sampling**: No light sampling or MIS
-4. **Denoising**: No AI denoiser or variance reduction
+4. **Denoising**: No denoiser or variance reduction
 5. **Spectral Rendering**: RGB only, no spectral path tracing
 6. **Adaptive Sampling**: Fixed SPP, no convergence detection
 7. **Textures**: No image-based materials
@@ -212,7 +218,7 @@ Use `bench/results_template.md` to record your findings. Example:
 ### Performance Limitations ⚠️
 
 - **Single-threaded CPU**: No multi-core parallelism yet
-- **No GPU Backend**: Awaiting Mind runtime GPU support
+- **CPU only**: the MIND renderer has no GPU path; GPU rendering uses the CUDA kernel
 - **Naive Intersection**: Linear search, not spatial partitioning
 - **Simple Materials**: No microfacet BRDFs or measured materials
 

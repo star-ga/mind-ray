@@ -1,362 +1,92 @@
-# Mind Ray Architecture
+# MIND-Ray Architecture
 
-## Overview
+MIND-Ray is two independent renderers that share scene presets:
 
-Mind Ray is a path tracing renderer implemented entirely in the Mind programming language. It demonstrates Mind's capability for high-performance graphics programming without requiring C++ or CUDA.
+| Part | Source | Built with | Runs on |
+|------|--------|------------|---------|
+| CPU renderer | `src/main.mind` | `mindc build` (MIND to MLIR to native) | CPU, single thread |
+| CUDA kernel | `native-cuda/*.cu` | `nvcc` | NVIDIA GPU |
 
-## Rendering Pipeline
+The CUDA kernel is hand-written CUDA C++ with a C ABI (`mindray_cuda_*`); the
+benchmark host `bench/cuda_benchmark.c` loads it. The MIND renderer does not
+call the CUDA kernel.
 
-```
-CLI Args → Scene Setup → Camera Setup → Render Loop → Output
-                                            ↓
-                                      [Per-Pixel]
-                                            ↓
-                              Camera Ray → Path Trace → Accumulate
-                                            ↓
-                          [Per Bounce: Intersect → Shade → Scatter]
-```
+## MIND CPU renderer
 
-### Pipeline Stages
-
-1. **Initialization**
-   - Parse command-line arguments
-   - Select scene (spheres/cornell/stress)
-   - Configure camera based on scene
-   - Initialize RNG with seed
-
-2. **Render Loop**
-   - For each pixel (y, x):
-     - For each sample (1..SPP):
-       - Generate camera ray with anti-aliasing jitter
-       - Trace path through scene
-       - Accumulate color contribution
-     - Average samples
-     - Apply tone mapping and gamma correction
-     - Write to output buffer
-
-3. **Path Tracing** (per sample)
-   - Start with camera ray
-   - For each bounce (1..max_bounces):
-     - Test ray against all scene geometry
-     - If miss: return background color, exit
-     - If hit emissive: add emission, exit
-     - If hit surface:
-       - Scatter based on material type
-       - Update ray direction
-       - Multiply throughput by BRDF
-       - Apply Russian roulette termination (after 3 bounces)
-   - Return accumulated radiance
-
-4. **Post-Processing**
-   - Tone mapping (Reinhard)
-   - Gamma correction (γ=2.2)
-   - Clamp to [0,1] range
-   - Convert to 8-bit RGB
-   - Write PPM file
-
-## Module Architecture
-
-### Core Modules
-
-**vec3.mind** - Vector Mathematics
-- 3D vector structure (x, y, z: f32)
-- Arithmetic operations (add, sub, mul, div, hadamard)
-- Geometric operations (dot, cross, length, normalize)
-- Reflection and refraction
-- Utility functions (clamp, near-zero test)
-
-**ray.mind** - Ray Representation
-- Ray structure (origin, direction)
-- Ray-point evaluation (ray.at(t))
-
-**camera.mind** - Camera System
-- Perspective camera with configurable FOV
-- Look-at positioning
-- Anti-aliased ray generation per pixel
-
-**rng.mind** - Random Number Generation
-- Xorshift32 PRNG for determinism
-- Per-pixel seeding for reproducibility
-- Uniform float generation [0,1)
-- Utilities for sphere sampling, hemisphere sampling
-
-**material.mind** - Material Types
-- Diffuse (Lambertian) - cosine-weighted hemisphere sampling
-- Metal - reflection with roughness (fuzziness)
-- Dielectric - refraction with Schlick approximation
-- Emissive - light emission with strength parameter
-- Scatter functions return (ray, attenuation, did_scatter)
-
-**hittable.mind** - Scene Geometry
-- HitRecord structure (point, normal, t, material, front_face)
-- Sphere primitive (analytical intersection)
-- Axis-aligned rectangle (for Cornell box walls)
-- Infinite plane (with procedural checkerboard)
-- Ray-primitive intersection tests
-
-**scene.mind** - Scene Definitions
-- Scene structure (arrays of objects + materials)
-- Three predefined scenes:
-  - **Spheres**: Classic three-sphere demo
-  - **Cornell Box**: Enclosed box with emissive light
-  - **Stress**: 8x8 grid of spheres (64 total)
-- Scene hit testing (linear search over all primitives)
-
-**render.mind** - Path Tracer
-- Main path tracing loop (ray_color)
-- Material dispatch (match on material type)
-- Russian roulette path termination
-- Tone mapping (Reinhard operator)
-- Gamma correction (sRGB)
-
-**io.mind** - Image Output
-- Binary PPM (P6) file format
-- RGB888 encoding
-- File I/O abstractions
-
-**main.mind** - Entry Point
-- CLI argument parsing
-- Scene selection and configuration
-- Render orchestration
-- Timing and metrics reporting
-- Benchmark mode
-
-## Data Structures
-
-### Vec3
-```mind
-struct Vec3 {
-    x: f32,
-    y: f32,
-    z: f32,
-}
-```
-
-Used for: positions, directions, colors, normals
-
-### Ray
-```mind
-struct Ray {
-    origin: Vec3,
-    direction: Vec3,
-}
-```
-
-### HitRecord
-```mind
-struct HitRecord {
-    point: Vec3,      // Intersection point
-    normal: Vec3,     // Surface normal (outward)
-    t: f32,           // Ray parameter at hit
-    front_face: bool, // Ray hit from outside?
-    material_idx: i32,// Index into material array
-    did_hit: bool,    // Was there an intersection?
-}
-```
-
-### Scene
-```mind
-struct Scene {
-    spheres: [Sphere; 64],
-    num_spheres: i32,
-    rects: [Rect; 16],
-    num_rects: i32,
-    planes: [Plane; 4],
-    num_planes: i32,
-    materials: [Material; 32],
-    num_materials: i32,
-    background: Vec3,
-}
-```
-
-Fixed-size arrays with counts for dynamic scenes within bounds.
-
-## Algorithms
-
-### Path Tracing Loop
+### Pipeline
 
 ```
-fn ray_color(ray, scene, max_bounces, rng):
-    throughput = (1, 1, 1)  # white
-    radiance = (0, 0, 0)    # black
-
-    for bounce in 0..max_bounces:
-        hit = scene.hit(ray)
-
-        if !hit:
-            # Sky lighting
-            radiance += throughput * sky_color
-            break
-
-        material = scene.materials[hit.material_idx]
-
-        if material is Emissive:
-            # Direct light hit
-            radiance += throughput * material.emission
-            break
-
-        # Scatter ray based on material
-        (scattered_ray, attenuation) = material.scatter(ray, hit, rng)
-
-        if !scattered:
-            break
-
-        # Update for next bounce
-        throughput *= attenuation
-        ray = scattered_ray
-
-        # Russian roulette (after 3 bounces)
-        if bounce >= 3:
-            survival_prob = min(max(throughput), 0.95)
-            if random() > survival_prob:
-                break
-            throughput /= survival_prob
-
-    return radiance
+stdin config -> build scene table -> for each pixel:
+                                       seed xorshift32 from (x, y, seed)
+                                       for each sample:
+                                         jittered camera ray -> trace_path
+                                       average, gamma 2, clamp -> 3 bytes
+             -> PPM (P6) to stdout, FNV-1a 32-bit hash line to stderr
 ```
 
-### Material Scattering
+`trace_path` follows one path for up to `bounces` surface interactions:
 
-**Diffuse (Lambertian):**
-```
-scatter_dir = hit.normal + random_unit_vector()
-attenuation = albedo
-```
+1. Find the closest hit over all primitives (`scene_hit`, linear scan).
+2. Miss: add `throughput * background` and stop.
+3. Emissive hit: add `throughput * emission` and stop.
+4. Otherwise scatter by material, multiply throughput by the albedo and continue.
 
-**Metal:**
-```
-reflected = reflect(ray.direction, hit.normal)
-scatter_dir = reflected + roughness * random_in_sphere()
-attenuation = albedo
-```
+| Material | Scatter |
+|----------|---------|
+| Diffuse | normal + random point in the unit sphere (Lambertian approximation) |
+| Metal | mirror reflection + `fuzz` * random point in the unit sphere; absorbed if it points below the surface |
+| Dielectric | refraction with Schlick reflectance; total internal reflection handled |
+| Emissive | terminates the path |
 
-**Dielectric:**
-```
-if cannot_refract or reflectance(cos_theta, ior) > random():
-    scatter_dir = reflect(ray.direction, hit.normal)
-else:
-    scatter_dir = refract(ray.direction, hit.normal, ior_ratio)
-attenuation = albedo  # typically white for glass
-```
+### Data layout
 
-## Performance Characteristics
+The released `mindc` v0.10.2 does not lower structs with float fields, so all
+state lives in local `f64` values or in raw memory:
 
-### Current Implementation
+| Buffer | Layout |
+|--------|--------|
+| Scene table | 16-slot header (primitive count, background, camera position, look-at, tan(vfov/2)) followed by one 16-slot record per primitive. Values are stored as integer thousandths and decoded on load. |
+| Primitive record | slot 0 kind (sphere / plane y=k / axis-aligned rectangle), slot 1 material, slots 2-4 albedo or emission, slot 5 fuzz or index of refraction, slots 9-14 geometry |
+| Work slots | hit index, random vector (integers in units of 2^-24), RNG state |
+| Accumulator | three i64 slots, radiance in units of 2^-24 |
+| Image | `width * height * 3` bytes, top row first |
 
-- **O(n) intersection**: Linear search over all primitives
-- **Single-threaded CPU**: No parallelism (yet)
-- **Deterministic RNG**: Xorshift32 per pixel
-- **Russian roulette**: Probabilistic path termination after 3 bounces
+### Determinism
 
-### Complexity Analysis
+- Only IEEE-754 f64 add, subtract, multiply and divide, in fixed source order.
+- `det_sqrt` uses range reduction and a fixed 8-step Newton iteration, not a
+  platform `sqrt`.
+- RNG is integer xorshift32; per-pixel seeds depend only on `(x, y, seed)`.
+- Sample radiance is accumulated as integers.
 
-For resolution W×H, SPP samples, max B bounces, N objects:
+`scripts/test.sh` rebuilds the renderer and compares the image hash of each
+scene with the recorded value.
 
-- **Time**: O(W × H × SPP × B × N) worst case
-- **Space**: O(W × H) for output buffer + O(N) for scene
-- **RNG calls**: ~10-20 per bounce (material dependent)
+### Why a single module
 
-### Bottlenecks
+`mindc` v0.10.2 also does not pass f64 values across module boundaries, so the
+renderer is one file. The earlier modular design (`vec3`, `ray`, `camera`,
+`material`, `hittable`, `scene`, `render`, `io`) is kept in
+`archive/mind-pre-0.10/` as the reference layout for splitting the renderer
+again once released `mindc` supports it.
 
-1. **Intersection tests** - Dominant cost without BVH
-2. **Material evaluation** - Branching on material type
-3. **RNG** - Frequent random number generation
-4. **Memory bandwidth** - Output buffer writes
+## CUDA kernel
 
-## Future Optimizations
+| File | Contents |
+|------|----------|
+| `mindray_cuda.cu` | Baseline kernel with progressive accumulation |
+| `mindray_cuda_opt.cu` | Optimized kernel |
+| `mindray_cuda_bvh.cu`, `bvh.cuh` | BVH-accelerated kernel used for the recorded benchmarks |
 
-### Planned Features
+Exported functions: `mindray_cuda_init`, `mindray_cuda_render_frame`,
+`mindray_cuda_copy_output`, `mindray_cuda_reset_accumulator`,
+`mindray_cuda_free`, `mindray_cuda_get_error`, `mindray_cuda_get_device_count`,
+`mindray_cuda_get_device_name`, `mindray_cuda_get_frame_count`,
+`mindray_cuda_set_num_spheres` and `mindray_cuda_get_num_spheres`; the BVH
+kernel also exports `mindray_cuda_render_batch`.
 
-1. **BVH Acceleration**
-   - Surface Area Heuristic (SAH) for splits
-   - 32-byte nodes (2 cache lines)
-   - Reduce intersection cost from O(n) to O(log n)
+Build: `native-cuda/build.sh` (Linux, `.so`) or `native-cuda/build_opt.ps1`
+(Windows, `.dll`). Both target `sm_75`, `sm_86`, `sm_89`, `sm_120` plus PTX.
 
-2. **GPU Backend** (via Mind Runtime)
-   - Massively parallel per-pixel rendering
-   - Warp-coherent BVH traversal
-   - Shared memory for accumulation
-
-3. **Multi-threading** (CPU)
-   - Tile-based parallelism
-   - Per-thread RNG state
-   - Lock-free output buffer
-
-4. **Importance Sampling**
-   - Direct light sampling
-   - Multiple Importance Sampling (MIS)
-   - Reduced variance, lower SPP needed
-
-5. **Advanced Materials**
-   - Microfacet BRDFs (GGX/Beckmann)
-   - Measured materials (BRDFs from data)
-   - Subsurface scattering
-
-### Architecture Changes for GPU
-
-When GPU backend is added:
-
-- **Kernel Launch**: One thread per pixel
-- **Shared Memory**: Accumulation buffers
-- **Texture Cache**: Scene data (BVH, materials)
-- **Register Pressure**: Minimize local variables
-- **Divergence**: Group rays by material type
-
-## Design Decisions
-
-### Why No BVH Yet?
-
-- **Simplicity**: Easier to understand and verify correctness
-- **Modularity**: BVH can be added without changing core algorithms
-- **Educational**: Shows performance impact clearly
-
-### Why Fixed-Size Arrays?
-
-- **Mind Constraints**: Dynamic allocation not yet in spec
-- **Predictable**: Known memory footprint
-- **GPU-Friendly**: No heap allocation on device
-
-### Why Xorshift32?
-
-- **Fast**: Single instruction per random number
-- **Deterministic**: Seedable for reproducibility
-- **Good Enough**: Sufficient quality for path tracing (not cryptographic)
-
-### Why PPM Output?
-
-- **Simple**: Trivial to implement without dependencies
-- **Portable**: Universally supported
-- **Uncompressed**: No codec complexity
-- **Future**: Easy to add PNG/EXR later
-
-## Comparison to Reference CUDA Implementation
-
-The original CUDA implementation (`archive/cuda_reference/main.cu`) and this Mind version share the same algorithmic approach but differ in:
-
-- **Language**: Mind vs. CUDA C++
-- **Execution**: Mind CPU (now) vs. CUDA GPU
-- **Scene Data**: Mind fixed arrays vs. CUDA __device__ globals
-- **RNG**: Same xorshift32 algorithm, different seeding
-
-Performance will differ due to serial CPU execution, but correctness is equivalent.
-
-## Testing & Validation
-
-### Correctness Tests
-
-- **Determinism**: Same seed produces identical output
-- **Energy Conservation**: No material amplifies light
-- **Reciprocity**: BRDF symmetry maintained
-- **Caustics**: Glass sphere shows refraction correctly
-
-### Performance Tests
-
-- **Scaling**: Linear with resolution and SPP
-- **Convergence**: Noise decreases as √SPP
-- **Benchmark Suite**: Three standardized scenes
-
-## References
-
-- [Ray Tracing in One Weekend](https://raytracing.github.io/)
-- [PBRT Book](https://www.pbr-book.org/)
-- [Scratchapixel](https://www.scratchapixel.com/)
+See [`../BENCHMARK.md`](../BENCHMARK.md) and [`../bench/README.md`](../bench/README.md)
+for the benchmark tiers.
