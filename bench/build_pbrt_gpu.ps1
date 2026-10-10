@@ -3,7 +3,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$PBRT_DIR = "C:\Users\Admin\projects\mind-ray\bench\third_party\pbrt-v4"
+$PBRT_DIR = Join-Path $PSScriptRoot "third_party\pbrt-v4"
 $BUILD_DIR = "$PBRT_DIR\build"
 $OPTIX_PATH = "C:\ProgramData\NVIDIA Corporation\OptiX SDK 9.1.0"
 $CUDA_PATH_LOCAL = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"

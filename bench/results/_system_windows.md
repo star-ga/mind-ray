@@ -13,10 +13,10 @@
 - **Architecture**: Ada Lovelace (AD106)
 
 ### CPU
-- Intel Core (see systeminfo.txt for full details)
+- Intel Core (see cpu.txt)
 
 ### Memory
-- System RAM: (see systeminfo.txt)
+- System RAM: 32 GB
 
 ## Software
 
@@ -27,7 +27,7 @@
 
 ### Operating System
 - **OS**: Windows 11
-- **Build**: See systeminfo.txt
+- **Build**: 26200
 
 ### Build Environment
 - **Compiler**: NVCC 12.8.93
@@ -39,7 +39,6 @@
 - **Note**: For reproducible results, always benchmark while plugged in with "Best Performance" power mode
 
 ## Raw Data Files
-- `systeminfo.txt` - Full Windows system info
 - `cpu.txt` - CPU model
 - `gpu.txt` - GPU identifier
 - `gpu_details.txt` - GPU details (driver, memory)

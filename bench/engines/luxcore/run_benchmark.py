@@ -7,8 +7,12 @@ import time
 import os
 import re
 
-LUXCORE_EXE = r"C:\Users\Admin\projects\mind-ray\bench\third_party\luxcorerender\luxcoreconsole.exe"
-SCENES_DIR = os.path.dirname(os.path.abspath(__file__)) + r"\scenes"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+LUXCORE_EXE = os.environ.get(
+    "LUXCORE_EXE",
+    os.path.join(_HERE, "..", "..", "third_party", "luxcorerender", "luxcoreconsole.exe"),
+)
+SCENES_DIR = os.path.join(_HERE, "scenes")
 
 
 def run_benchmark(cfg_file: str, timeout: int = 300) -> dict:
