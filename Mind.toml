@@ -1,0 +1,10 @@
+[package]
+name = "mind-ray"
+version = "0.2.0"
+authors = ["STARGA Inc."]
+license = "MIT"
+description = "MIND-Ray: a deterministic CPU path tracer written in MIND, with a CUDA kernel for NVIDIA GPUs"
+
+[build]
+target = "cpu"
+entry = "src/main.mind"

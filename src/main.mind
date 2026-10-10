@@ -1,1110 +1,962 @@
-// main.mind - Mind Ray Tracer
+// main.mind - MIND-Ray CPU path tracer.
 //
-// Pure Mind language path tracer implementation.
-// Currently CPU-only; GPU backend integration is planned via FFI.
+// A complete, runnable path tracer written in the executable subset of the
+// MIND language that the released `mindc` 0.10.2 compiles to a native binary.
 //
-// Features:
-// - Multiple scene presets (spheres, cornell box, stress test)
-// - Configurable samples per pixel (SPP) and bounce depth
-// - Deterministic rendering with seed-based xorshift32 RNG
-// - Performance benchmarking suite
-// - FNV-1a image hashing for reproducibility verification
+//   Scenes:     spheres | cornell | stress   (the presets of the pre-0.10
+//               sources in archive/mind-pre-0.10/scene.mind; spheres adds a
+//               small glass sphere to exercise the dielectric material)
+//   Geometry:   spheres, horizontal ground planes, axis-aligned rectangles
+//   Materials:  diffuse (Lambertian), metal (fuzzy reflection),
+//               dielectric (refraction + Schlick), emissive (area lights)
+//   RNG:        xorshift32, seeded per pixel from (x, y, seed)
+//   Output:     binary PPM (P6) on stdout, FNV-1a 32-bit image hash on stderr
 //
-// Usage:
-//   mind-ray render --scene spheres --spp 64 --out render.ppm
-//   mind-ray bench --backend cpu
-//   mind-ray verify --seed 42
+// Input is read from stdin as whitespace-separated fields:
 //
-// Backend Support:
-//   - cpu: Single-threaded CPU rendering (default, always available)
-//   - gpu: CUDA GPU backend via FFI (requires mindray_cuda.dll)
-//   - auto: Auto-detect GPU, fallback to CPU
+//   <scene> <width> <height> <spp> <bounces> <seed>
+//
+//   echo "cornell 320 240 32 6 42" | ./target/debug/mind-ray > cornell.ppm
+//
+// Missing fields fall back to: spheres 320 180 16 4 42.
+//
+// WHY THE CODE IS SHAPED THIS WAY.  The released mindc 0.10.2 lowers f64
+// scalars, i64 integers, while-loops and raw memory intrinsics, but not
+// structs with float fields, `sqrt`, command-line arguments, or f64 values
+// across a module boundary.  The renderer therefore:
+//   - keeps vectors as three f64 locals instead of a Vec3 struct;
+//   - stores the scene table as integer thousandths and decodes on load;
+//   - computes square roots with a fixed-iteration Newton solve (det_sqrt);
+//   - reads its configuration from stdin instead of argv;
+//   - lives in one module.
+// deferred: would split into vec3/ray/camera/material/scene modules with a
+// Vec3 struct, stdlib sqrt and argv parsing, stubbed because mindc 0.10.2 does
+// not lower float-field structs, `sqrt` or argv on the default backend, nor
+// f64 across module boundaries — upgrade path: re-introduce the module split
+// once those land in a released mindc; the pre-0.10 module sources are kept
+// under archive/mind-pre-0.10/ as the reference layout.
+//
+// Every arithmetic step is plain IEEE-754 f64 add/sub/mul/div in a fixed
+// source order with no transcendental calls, so the image hash printed on
+// stderr is stable from run to run on the same toolchain.
 //
 // Author: STARGA Inc.
 // License: MIT
 
-import vec3;
-import ray;
-import camera;
-import material;
-import hittable;
-import scene;
-import render;
-import rng;
-import io;
-
 // =============================================================================
-// Configuration
+// Constants
 // =============================================================================
 
-/// Render configuration containing all parameters for a render job
-struct Config {
-    /// Compute backend: "cpu", "gpu", or "auto" (auto-detect)
-    backend: str,
-    /// Scene preset name: "spheres", "cornell", or "stress"
-    scene_name: str,
-    /// Output image width in pixels
-    width: i32,
-    /// Output image height in pixels
-    height: i32,
-    /// Samples per pixel (higher = less noise, slower)
-    spp: i32,
-    /// Maximum ray bounce depth (higher = more accurate GI, slower)
-    bounces: i32,
-    /// Number of progressive frames to accumulate
-    frames: i32,
-    /// RNG seed for deterministic rendering
-    seed: i32,
-    /// Output file path (PPM format)
-    output_path: str,
-    /// Whether running in benchmark mode
-    bench_mode: bool,
+// One scene-table record holds this many i64 slots.
+const REC: i64 = 16
+// Maximum number of primitives in a scene.
+const MAX_PRIMS: i64 = 80
+// Scene values are stored as integer thousandths.
+const MILLI: f64 = 1000.0
+// xorshift32 state mask.
+const MASK32: i64 = 4294967295
+
+// Primitive kinds (slot 0).
+const PRIM_SPHERE: i64 = 0
+const PRIM_PLANE: i64 = 1
+const PRIM_RECT: i64 = 2
+
+// Material kinds (slot 1).
+const MAT_DIFFUSE: i64 = 0
+const MAT_METAL: i64 = 1
+const MAT_DIELECTRIC: i64 = 2
+const MAT_EMISSIVE: i64 = 3
+
+// Scene ids.
+const SCENE_SPHERES: i64 = 0
+const SCENE_CORNELL: i64 = 1
+const SCENE_STRESS: i64 = 2
+
+// Scene header layout (slots before the primitive records):
+//   0 primitive count
+//   1..3   background rgb       (milli)
+//   4..6   camera position      (milli)
+//   7..9   camera look-at       (milli)
+//   10     tan(vfov / 2)        (milli)
+const HDR: i64 = 16
+
+// =============================================================================
+// Memory helpers (i64 slots)
+// =============================================================================
+
+fn slot_addr(base: i64, idx: i64) -> i64 {
+    return base + idx * 8;
 }
 
-/// Create default configuration with sensible defaults
-///
-/// # Returns
-/// * Config with default values suitable for preview rendering
-fn config_default() -> Config {
-    Config {
-        backend: "auto",
-        scene_name: "spheres",
-        width: 800,
-        height: 450,
-        spp: 16,
-        bounces: 4,
-        frames: 1,
-        seed: 1,
-        output_path: "out/render.ppm",
-        bench_mode: false,
+fn set_slot(base: i64, idx: i64, v: i64) -> i64 {
+    __mind_store_i64(slot_addr(base, idx), v);
+    return 0;
+}
+
+fn get_slot(base: i64, idx: i64) -> i64 {
+    return __mind_load_i64(slot_addr(base, idx));
+}
+
+// Decode a slot stored in thousandths into f64.
+fn get_milli(base: i64, idx: i64) -> f64 {
+    return (get_slot(base, idx) as f64) / MILLI;
+}
+
+fn prim_base(scene: i64, i: i64) -> i64 {
+    return slot_addr(scene, HDR + i * REC);
+}
+
+// =============================================================================
+// Scalar math
+// =============================================================================
+
+fn absf(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - x;
     }
+    return x;
+}
+
+fn minf(a: f64, b: f64) -> f64 {
+    if a < b {
+        return a;
+    }
+    return b;
+}
+
+fn clamp01(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0;
+    }
+    if x > 1.0 {
+        return 1.0;
+    }
+    return x;
+}
+
+// Square root by range reduction to [0.25, 4) and a fixed 8-step Newton
+// iteration. Fixed iteration count keeps the result independent of input.
+fn det_sqrt(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let mut m: f64 = x;
+    let mut scale: f64 = 1.0;
+    while m >= 4.0 {
+        m = m * 0.25;
+        scale = scale * 2.0;
+    }
+    while m < 0.25 {
+        m = m * 4.0;
+        scale = scale * 0.5;
+    }
+    let mut y: f64 = 0.5 * (m + 1.0);
+    let mut i: i64 = 0;
+    while i < 8 {
+        y = 0.5 * (y + m / y);
+        i = i + 1;
+    }
+    return y * scale;
+}
+
+fn dot3(ax: f64, ay: f64, az: f64, bx: f64, by: f64, bz: f64) -> f64 {
+    return ax * bx + ay * by + az * bz;
+}
+
+fn len3(x: f64, y: f64, z: f64) -> f64 {
+    return det_sqrt(dot3(x, y, z, x, y, z));
+}
+
+// Schlick's approximation for dielectric reflectance.
+fn schlick(cosine: f64, ref_idx: f64) -> f64 {
+    let r: f64 = (1.0 - ref_idx) / (1.0 + ref_idx);
+    let r0: f64 = r * r;
+    let c: f64 = 1.0 - cosine;
+    return r0 + (1.0 - r0) * (c * c * c * c * c);
 }
 
 // =============================================================================
-// Commands
+// RNG: xorshift32, state kept in one i64 slot
 // =============================================================================
 
-/// Available CLI commands
-enum Command {
-    /// Render a scene to an image file (default)
-    Render,
-    /// Run the benchmark suite
-    Bench,
-    /// Verify determinism by rendering twice with same seed
-    Verify,
-    /// Quick sanity check - render tiny image and verify hash
-    Selfcheck,
-    /// Display help message
-    Help,
+fn rng_next(rng: i64) -> i64 {
+    let mut x: i64 = __mind_load_i64(rng);
+    x = x ^ ((x << 13) & MASK32);
+    x = x ^ (x >> 17);
+    x = x ^ ((x << 5) & MASK32);
+    __mind_store_i64(rng, x);
+    return x;
 }
 
-/// Parse command-line arguments into a Command and Config
-///
-/// Supports subcommands (render, bench, verify, help) and various flags
-/// for configuring the render parameters. Validates all numeric arguments.
-///
-/// # Arguments
-/// * `args` - Command-line arguments array (args[0] is program name)
-///
-/// # Returns
-/// * Tuple of (Command, Config) with parsed values
-///
-/// # Argument Syntax
-/// * `--backend cpu|gpu|auto` - Select compute backend
-/// * `--scene NAME` - Scene preset (spheres, cornell, stress)
-/// * `--width N` or `--w N` - Image width (1-16384)
-/// * `--height N` or `--h N` - Image height (1-16384)
-/// * `--spp N` - Samples per pixel (1-65536)
-/// * `--bounces N` - Max ray bounces (0-100)
-/// * `--frames N` - Progressive frames (1-1000)
-/// * `--seed N` - RNG seed (any integer)
-/// * `--out PATH` - Output file path
-///
-/// # Error Handling
-/// Exits with code 1 if any numeric argument is invalid or out of range.
-fn parse_args(args: [str]) -> (Command, Config) {
-    let mut config = config_default();
-    let mut command = Command::Render;  // Default command
-    let mut i = 1;  // Skip program name (args[0])
+// Uniform f64 in [0, 1) with 24 bits of resolution.
+fn rng_f64(rng: i64) -> f64 {
+    return ((rng_next(rng) >> 8) as f64) / 16777216.0;
+}
 
-    // First argument might be a subcommand
-    if args.len() > 1 {
-        let first_arg = args[1];
-        if first_arg == "render" {
-            command = Command::Render;
-            i = 2;
-        } else if first_arg == "bench" {
-            command = Command::Bench;
-            i = 2;
-        } else if first_arg == "verify" {
-            command = Command::Verify;
-            i = 2;
-        } else if first_arg == "help" || first_arg == "--help" {
-            command = Command::Help;
-            i = 2;
-        } else if first_arg == "selfcheck" {
-            command = Command::Selfcheck;
-            i = 2;
+// Seed the per-pixel stream from (x, y, seed); never zero.
+fn rng_seed(rng: i64, x: i64, y: i64, seed: i64) -> i64 {
+    let mut s: i64 = (seed * 1973 + x * 9277 + y * 26699) & MASK32;
+    s = s | 1;
+    __mind_store_i64(rng, s);
+    rng_next(rng);
+    rng_next(rng);
+    return 0;
+}
+
+// Random point inside the unit sphere (rejection sampling). The three
+// coordinates are written to v[0..2] as integers in units of 2^-24, which
+// keeps them exact in i64 slots.
+fn rng_in_sphere(rng: i64, v: i64) -> i64 {
+    let mut done: i64 = 0;
+    while done == 0 {
+        let a: i64 = (rng_next(rng) >> 8) * 2 - 16777216;
+        let b: i64 = (rng_next(rng) >> 8) * 2 - 16777216;
+        let c: i64 = (rng_next(rng) >> 8) * 2 - 16777216;
+        let fa: f64 = (a as f64) / 16777216.0;
+        let fb: f64 = (b as f64) / 16777216.0;
+        let fc: f64 = (c as f64) / 16777216.0;
+        if dot3(fa, fb, fc, fa, fb, fc) < 1.0 {
+            set_slot(v, 0, a);
+            set_slot(v, 1, b);
+            set_slot(v, 2, c);
+            done = 1;
         }
-        // If not a subcommand, treat as flag and start parsing from index 1
     }
+    return 0;
+}
 
-    // Parse remaining flags
-    while i < args.len() {
-        let arg = args[i];
-        let has_next = i + 1 < args.len();
+fn rand_comp(v: i64, i: i64) -> f64 {
+    return (get_slot(v, i) as f64) / 16777216.0;
+}
 
-        if arg == "--backend" && has_next {
-            let backend_val = args[i + 1];
-            // Validate backend value
-            if backend_val != "cpu" && backend_val != "gpu" && backend_val != "auto" {
-                println(format("ERROR: Invalid backend '{}'. Must be: cpu, gpu, or auto", backend_val));
-                exit(1);
+// =============================================================================
+// Scene construction
+// =============================================================================
+
+fn set_material(p: i64, kind: i64, r: i64, g: i64, b: i64, param: i64) -> i64 {
+    set_slot(p, 1, kind);
+    set_slot(p, 2, r);
+    set_slot(p, 3, g);
+    set_slot(p, 4, b);
+    set_slot(p, 5, param);
+    return 0;
+}
+
+fn add_sphere(scene: i64, cx: i64, cy: i64, cz: i64, rad: i64) -> i64 {
+    let n: i64 = get_slot(scene, 0);
+    let p: i64 = prim_base(scene, n);
+    set_slot(p, 0, PRIM_SPHERE);
+    set_slot(p, 9, cx);
+    set_slot(p, 10, cy);
+    set_slot(p, 11, cz);
+    set_slot(p, 12, rad);
+    set_slot(scene, 0, n + 1);
+    return p;
+}
+
+fn add_plane_y(scene: i64, k: i64) -> i64 {
+    let n: i64 = get_slot(scene, 0);
+    let p: i64 = prim_base(scene, n);
+    set_slot(p, 0, PRIM_PLANE);
+    set_slot(p, 9, k);
+    set_slot(scene, 0, n + 1);
+    return p;
+}
+
+// Axis-aligned rectangle. axis 0: x = k, spans (y in a0..a1, z in b0..b1);
+// axis 1: y = k, spans (x, z); axis 2: z = k, spans (x, y).
+fn add_rect(scene: i64, axis: i64, a0: i64, a1: i64, b0: i64, b1: i64, k: i64) -> i64 {
+    let n: i64 = get_slot(scene, 0);
+    let p: i64 = prim_base(scene, n);
+    set_slot(p, 0, PRIM_RECT);
+    set_slot(p, 9, axis);
+    set_slot(p, 10, a0);
+    set_slot(p, 11, a1);
+    set_slot(p, 12, b0);
+    set_slot(p, 13, b1);
+    set_slot(p, 14, k);
+    set_slot(scene, 0, n + 1);
+    return p;
+}
+
+fn set_camera(scene: i64, px: i64, py: i64, pz: i64, lx: i64, ly: i64, lz: i64, tan_half: i64) -> i64 {
+    set_slot(scene, 4, px);
+    set_slot(scene, 5, py);
+    set_slot(scene, 6, pz);
+    set_slot(scene, 7, lx);
+    set_slot(scene, 8, ly);
+    set_slot(scene, 9, lz);
+    set_slot(scene, 10, tan_half);
+    return 0;
+}
+
+fn set_background(scene: i64, r: i64, g: i64, b: i64) -> i64 {
+    set_slot(scene, 1, r);
+    set_slot(scene, 2, g);
+    set_slot(scene, 3, b);
+    return 0;
+}
+
+// Three spheres on a ground plane under a sky-coloured background.
+fn build_spheres(scene: i64) -> i64 {
+    set_material(add_sphere(scene, 0, 1000, 0 - 3500, 1000), MAT_DIFFUSE, 800, 300, 200, 0);
+    set_material(add_sphere(scene, 0 - 1800, 900, 0 - 2400, 900), MAT_DIFFUSE, 200, 700, 900, 0);
+    set_material(add_sphere(scene, 1700, 800, 0 - 2000, 800), MAT_METAL, 900, 850, 700, 150);
+    set_material(add_sphere(scene, 450, 350, 0 - 1500, 350), MAT_DIELECTRIC, 1000, 1000, 1000, 1500);
+    set_material(add_plane_y(scene, 0), MAT_DIFFUSE, 500, 500, 500, 0);
+    set_background(scene, 600, 750, 950);
+    // tan(55 deg / 2) = 0.5206
+    set_camera(scene, 0, 1200, 1200, 0, 900, 0 - 2800, 521);
+    return 0;
+}
+
+// Cornell box: coloured walls, a ceiling area light, a diffuse and a metal
+// sphere, black background.
+fn build_cornell(scene: i64) -> i64 {
+    set_material(add_rect(scene, 1, 0 - 2500, 2500, 0 - 2500, 2500, 0), MAT_DIFFUSE, 730, 730, 730, 0);
+    set_material(add_rect(scene, 1, 0 - 2500, 2500, 0 - 2500, 2500, 5000), MAT_DIFFUSE, 730, 730, 730, 0);
+    set_material(add_rect(scene, 2, 0 - 2500, 2500, 0, 5000, 0 - 2500), MAT_DIFFUSE, 730, 730, 730, 0);
+    set_material(add_rect(scene, 0, 0, 5000, 0 - 2500, 2500, 0 - 2500), MAT_DIFFUSE, 650, 50, 50, 0);
+    set_material(add_rect(scene, 0, 0, 5000, 0 - 2500, 2500, 2500), MAT_DIFFUSE, 120, 450, 150, 0);
+    set_material(add_rect(scene, 1, 0 - 1000, 1000, 0 - 1000, 1000, 4990), MAT_EMISSIVE, 15000, 15000, 15000, 0);
+    set_material(add_sphere(scene, 0 - 1000, 700, 0 - 1000, 700), MAT_DIFFUSE, 730, 730, 730, 0);
+    set_material(add_sphere(scene, 1200, 500, 500, 500), MAT_METAL, 900, 900, 900, 50);
+    set_background(scene, 0, 0, 0);
+    // tan(40 deg / 2) = 0.3640
+    set_camera(scene, 0, 2500, 10000, 0, 2500, 0, 364);
+    return 0;
+}
+
+// 8x8 grid of small spheres (metal + three diffuse colours) on a ground plane.
+fn build_stress(scene: i64) -> i64 {
+    set_material(add_plane_y(scene, 0), MAT_DIFFUSE, 500, 500, 500, 0);
+    let mut i: i64 = 0;
+    while i < 8 {
+        let mut j: i64 = 0;
+        while j < 8 {
+            let x: i64 = 0 - 8000 + i * 2000 + 500;
+            let z: i64 = 0 - 8000 + j * 2000 + 500;
+            let p: i64 = add_sphere(scene, x, 300, z, 300);
+            let m: i64 = (i + j) % 4;
+            if m == 0 {
+                set_material(p, MAT_METAL, 800, 800, 800, 300)
             }
-            config.backend = backend_val;
-            i = i + 2;
-        } else if arg == "--scene" && has_next {
-            let scene_val = args[i + 1];
-            // Validate scene name
-            if scene_val != "spheres" && scene_val != "cornell" && scene_val != "stress" {
-                println(format("WARNING: Unknown scene '{}'. Falling back to 'spheres'.", scene_val));
+            if m == 1 {
+                set_material(p, MAT_DIFFUSE, 800, 400, 400, 0)
             }
-            config.scene_name = scene_val;
-            i = i + 2;
-        } else if (arg == "--width" || arg == "--w") && has_next {
-            let parsed = parse_i32_arg(args[i + 1], "width");
-            config.width = parsed;
-            i = i + 2;
-        } else if (arg == "--height" || arg == "--h") && has_next {
-            let parsed = parse_i32_arg(args[i + 1], "height");
-            config.height = parsed;
-            i = i + 2;
-        } else if arg == "--spp" && has_next {
-            let parsed = parse_i32_arg(args[i + 1], "spp");
-            config.spp = parsed;
-            i = i + 2;
-        } else if arg == "--bounces" && has_next {
-            let parsed = parse_i32_arg(args[i + 1], "bounces");
-            config.bounces = parsed;
-            i = i + 2;
-        } else if arg == "--frames" && has_next {
-            let parsed = parse_i32_arg(args[i + 1], "frames");
-            config.frames = parsed;
-            i = i + 2;
-        } else if arg == "--seed" && has_next {
-            let parsed = parse_i32_arg(args[i + 1], "seed");
-            config.seed = parsed;
-            i = i + 2;
-        } else if arg == "--out" && has_next {
-            config.output_path = args[i + 1];
-            i = i + 2;
-        } else if arg == "--help" {
-            command = Command::Help;
-            break;
+            if m == 2 {
+                set_material(p, MAT_DIFFUSE, 400, 800, 400, 0)
+            }
+            if m == 3 {
+                set_material(p, MAT_DIFFUSE, 400, 400, 800, 0)
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    set_background(scene, 500, 600, 700);
+    // tan(50 deg / 2) = 0.4663
+    set_camera(scene, 0, 3000, 12000, 0, 1000, 0, 466);
+    return 0;
+}
+
+fn build_scene(scene: i64, id: i64) -> i64 {
+    set_slot(scene, 0, 0);
+    if id == SCENE_CORNELL {
+        return build_cornell(scene);
+    }
+    if id == SCENE_STRESS {
+        return build_stress(scene);
+    }
+    return build_spheres(scene);
+}
+
+// =============================================================================
+// Intersection
+// =============================================================================
+
+// Ray-sphere: nearest root in (tmin, tmax), or -1.
+fn hit_sphere(p: i64, ox: f64, oy: f64, oz: f64, dx: f64, dy: f64, dz: f64, tmin: f64, tmax: f64) -> f64 {
+    let cx: f64 = get_milli(p, 9);
+    let cy: f64 = get_milli(p, 10);
+    let cz: f64 = get_milli(p, 11);
+    let r: f64 = get_milli(p, 12);
+    let ocx: f64 = ox - cx;
+    let ocy: f64 = oy - cy;
+    let ocz: f64 = oz - cz;
+    let a: f64 = dot3(dx, dy, dz, dx, dy, dz);
+    let hb: f64 = dot3(ocx, ocy, ocz, dx, dy, dz);
+    let c: f64 = dot3(ocx, ocy, ocz, ocx, ocy, ocz) - r * r;
+    let disc: f64 = hb * hb - a * c;
+    if disc < 0.0 {
+        return 0.0 - 1.0;
+    }
+    let sq: f64 = det_sqrt(disc);
+    let t0: f64 = (0.0 - hb - sq) / a;
+    if t0 > tmin {
+        if t0 < tmax {
+            return t0;
+        }
+    }
+    let t1: f64 = (0.0 - hb + sq) / a;
+    if t1 > tmin {
+        if t1 < tmax {
+            return t1;
+        }
+    }
+    return 0.0 - 1.0;
+}
+
+// Ray against the horizontal plane y = k.
+fn hit_plane(p: i64, oy: f64, dy: f64, tmin: f64, tmax: f64) -> f64 {
+    if absf(dy) < 0.000001 {
+        return 0.0 - 1.0;
+    }
+    let t: f64 = (get_milli(p, 9) - oy) / dy;
+    if t > tmin {
+        if t < tmax {
+            return t;
+        }
+    }
+    return 0.0 - 1.0;
+}
+
+// Ray against an axis-aligned rectangle (see add_rect for the axis layout).
+fn hit_rect(p: i64, ox: f64, oy: f64, oz: f64, dx: f64, dy: f64, dz: f64, tmin: f64, tmax: f64) -> f64 {
+    let axis: i64 = get_slot(p, 9);
+    let k: f64 = get_milli(p, 14);
+    let mut on: f64 = ox;
+    let mut dn: f64 = dx;
+    let mut oa: f64 = oy;
+    let mut da: f64 = dy;
+    let mut ob: f64 = oz;
+    let mut db: f64 = dz;
+    if axis == 1 {
+        on = oy;
+        dn = dy;
+        oa = ox;
+        da = dx;
+        ob = oz;
+        db = dz;
+    }
+    if axis == 2 {
+        on = oz;
+        dn = dz;
+        oa = ox;
+        da = dx;
+        ob = oy;
+        db = dy;
+    }
+    if absf(dn) < 0.000001 {
+        return 0.0 - 1.0;
+    }
+    let t: f64 = (k - on) / dn;
+    if t <= tmin {
+        return 0.0 - 1.0;
+    }
+    if t >= tmax {
+        return 0.0 - 1.0;
+    }
+    let a: f64 = oa + t * da;
+    let b: f64 = ob + t * db;
+    if a < get_milli(p, 10) {
+        return 0.0 - 1.0;
+    }
+    if a > get_milli(p, 11) {
+        return 0.0 - 1.0;
+    }
+    if b < get_milli(p, 12) {
+        return 0.0 - 1.0;
+    }
+    if b > get_milli(p, 13) {
+        return 0.0 - 1.0;
+    }
+    return t;
+}
+
+// Closest hit over the whole scene. Returns t (or -1) and writes the index of
+// the primitive that was hit into the `hit_idx` slot.
+fn scene_hit(scene: i64, hit_idx: i64, ox: f64, oy: f64, oz: f64, dx: f64, dy: f64, dz: f64) -> f64 {
+    let n: i64 = get_slot(scene, 0);
+    let mut best: f64 = 1000000.0;
+    let mut found: i64 = 0 - 1;
+    let mut i: i64 = 0;
+    while i < n {
+        let p: i64 = prim_base(scene, i);
+        let kind: i64 = get_slot(p, 0);
+        let mut t: f64 = 0.0 - 1.0;
+        if kind == PRIM_SPHERE {
+            t = hit_sphere(p, ox, oy, oz, dx, dy, dz, 0.001, best);
+        }
+        if kind == PRIM_PLANE {
+            t = hit_plane(p, oy, dy, 0.001, best);
+        }
+        if kind == PRIM_RECT {
+            t = hit_rect(p, ox, oy, oz, dx, dy, dz, 0.001, best);
+        }
+        if t > 0.0 {
+            best = t;
+            found = i;
+        }
+        i = i + 1;
+    }
+    set_slot(hit_idx, 0, found);
+    if found < 0 {
+        return 0.0 - 1.0;
+    }
+    return best;
+}
+
+// =============================================================================
+// Path tracing
+// =============================================================================
+
+// Trace one camera path. Radiance is accumulated (in units of 2^-24) into the
+// three slots acc[0..2]. `work` provides scratch slots: [0] hit index,
+// [1..3] random vector, [4] rng state.
+fn trace_path(scene: i64, work: i64, acc: i64, ox0: f64, oy0: f64, oz0: f64, dx0: f64, dy0: f64, dz0: f64, bounces: i64) -> i64 {
+    let rng: i64 = slot_addr(work, 4);
+    let rv: i64 = slot_addr(work, 1);
+    let mut ox: f64 = ox0;
+    let mut oy: f64 = oy0;
+    let mut oz: f64 = oz0;
+    let mut dx: f64 = dx0;
+    let mut dy: f64 = dy0;
+    let mut dz: f64 = dz0;
+    let mut tr: f64 = 1.0;
+    let mut tg: f64 = 1.0;
+    let mut tb: f64 = 1.0;
+    let mut lr: f64 = 0.0;
+    let mut lg: f64 = 0.0;
+    let mut lb: f64 = 0.0;
+    let mut depth: i64 = 0;
+    let mut alive: i64 = 1;
+    while alive == 1 {
+        let t: f64 = scene_hit(scene, work, ox, oy, oz, dx, dy, dz);
+        if t < 0.0 {
+            lr = lr + tr * get_milli(scene, 1);
+            lg = lg + tg * get_milli(scene, 2);
+            lb = lb + tb * get_milli(scene, 3);
+            alive = 0;
         } else {
-            println(format("ERROR: Unknown or incomplete argument: {}", arg));
-            println("Use 'mind-ray help' for usage information.");
-            exit(1);
-        }
-    }
-
-    (command, config)
-}
-
-/// Parse an integer argument with validation and error reporting
-///
-/// # Arguments
-/// * `value` - String value to parse
-/// * `arg_name` - Name of argument (for error messages)
-///
-/// # Returns
-/// * Parsed integer value
-///
-/// # Panics
-/// Exits with code 1 if parsing fails or value is invalid
-fn parse_i32_arg(value: str, arg_name: str) -> i32 {
-    if value.len() == 0 {
-        println(format("ERROR: Empty value for --{}", arg_name));
-        exit(1);
-    }
-
-    // Check for invalid characters before parsing
-    let mut has_digits = false;
-    let mut valid = true;
-    for (idx, ch) in value.chars().enumerate() {
-        if idx == 0 && ch == '-' {
-            // Leading minus is OK
-            continue;
-        }
-        if ch >= '0' && ch <= '9' {
-            has_digits = true;
-        } else {
-            valid = false;
-            break;
-        }
-    }
-
-    if !valid || !has_digits {
-        println(format("ERROR: Invalid integer '{}' for --{}", value, arg_name));
-        exit(1);
-    }
-
-    __mind_str_to_i32(value)
-}
-
-// =============================================================================
-// Help and Usage Information
-// =============================================================================
-
-/// Print help message with usage information
-///
-/// Displays comprehensive usage documentation including commands,
-/// options, and examples.
-fn print_help() {
-    println("Mind Ray - GPU Path Tracer");
-    println("100% Mind language implementation - no C++/CUDA dependencies");
-    println("");
-    println("USAGE:");
-    println("    mind-ray <command> [options]");
-    println("");
-    println("COMMANDS:");
-    println("    render    Render a scene to an image file (default)");
-    println("    bench     Run performance benchmark suite");
-    println("    verify    Verify deterministic rendering");
-    println("    selfcheck Quick sanity check (PASS/FAIL)");
-    println("    help      Display this help message");
-    println("");
-    println("OPTIONS:");
-    println("    --backend <TYPE>   Compute backend: cpu, gpu, or auto (default: auto)");
-    println("    --scene <NAME>     Scene preset: spheres, cornell, stress (default: spheres)");
-    println("    --width, -w <N>    Output image width in pixels (default: 800)");
-    println("    --height, -h <N>   Output image height in pixels (default: 450)");
-    println("    --spp <N>          Samples per pixel - higher = less noise (default: 16)");
-    println("    --bounces <N>      Maximum ray bounce depth (default: 4)");
-    println("    --frames <N>       Progressive accumulation frames (default: 1)");
-    println("    --seed <N>         RNG seed for deterministic output (default: 1)");
-    println("    --out <PATH>       Output file path (default: out/render.ppm)");
-    println("    --help             Display this help message");
-    println("");
-    println("EXAMPLES:");
-    println("    # Render Cornell box at high quality");
-    println("    mind-ray render --scene cornell --spp 256 --bounces 8");
-    println("");
-    println("    # Run CPU benchmark");
-    println("    mind-ray bench --backend cpu");
-    println("");
-    println("    # Verify determinism with specific seed");
-    println("    mind-ray verify --seed 42 --spp 32");
-    println("");
-    println("    # Quick preview render");
-    println("    mind-ray --spp 4 --out preview.ppm");
-}
-
-// =============================================================================
-// Scene Loading
-// =============================================================================
-
-/// Load a scene and its associated camera by name
-///
-/// Each scene preset includes pre-configured camera position and settings
-/// optimized for that particular scene layout.
-///
-/// # Arguments
-/// * `scene_name` - Scene preset name: "spheres", "cornell", or "stress"
-/// * `aspect_ratio` - Aspect ratio (width/height) for the camera
-///
-/// # Returns
-/// * Tuple of (Scene, Camera) ready for rendering
-///
-/// # Scene Descriptions
-/// * "spheres" - Classic ray tracing scene with reflective spheres
-/// * "cornell" - Cornell box for global illumination testing
-/// * "stress" - High-complexity scene for performance testing
-fn load_scene(scene_name: str, aspect_ratio: f32) -> (Scene, Camera) {
-    let scene = if scene_name == "cornell" {
-        scene_cornell()
-    } else if scene_name == "stress" {
-        scene_stress()
-    } else {
-        scene_spheres()  // Default fallback
-    };
-
-    // Configure camera based on scene
-    // Each scene has a carefully chosen viewpoint
-    // Aspect ratio is computed from actual render dimensions
-    let camera = if scene_name == "cornell" {
-        // Cornell box: front-facing view centered on box
-        camera_new(
-            vec3(0.0, 2.5, 10.0),   // Camera position
-            vec3(0.0, 2.5, 0.0),    // Look-at point
-            vec3(0.0, 1.0, 0.0),    // Up vector
-            40.0,                   // Vertical FOV (degrees)
-            aspect_ratio           // Use actual render aspect ratio
-        )
-    } else if scene_name == "stress" {
-        // Stress test: wider view to capture many objects
-        camera_new(
-            vec3(0.0, 3.0, 12.0),
-            vec3(0.0, 1.0, 0.0),
-            vec3(0.0, 1.0, 0.0),
-            50.0,
-            aspect_ratio
-        )
-    } else {
-        // Spheres: close-up dramatic angle
-        camera_new(
-            vec3(0.0, 1.2, 1.2),
-            vec3(0.0, 0.9, -2.8),
-            vec3(0.0, 1.0, 0.0),
-            55.0,
-            aspect_ratio
-        )
-    };
-
-    (scene, camera)
-}
-
-// =============================================================================
-// Core Rendering
-// =============================================================================
-
-/// Validate render configuration
-///
-/// Checks that all parameters are within valid ranges.
-///
-/// # Arguments
-/// * `config` - Configuration to validate
-///
-/// # Returns
-/// * true if valid, false otherwise
-fn validate_config(config: &Config) -> bool {
-    // Validate dimensions
-    if config.width <= 0 || config.width > 16384 {
-        println(format("ERROR: Invalid width {} (must be 1-16384)", config.width));
-        return false;
-    }
-    if config.height <= 0 || config.height > 16384 {
-        println(format("ERROR: Invalid height {} (must be 1-16384)", config.height));
-        return false;
-    }
-
-    // Validate samples per pixel
-    if config.spp <= 0 || config.spp > 65536 {
-        println(format("ERROR: Invalid spp {} (must be 1-65536)", config.spp));
-        return false;
-    }
-
-    // Validate bounce depth
-    if config.bounces < 0 || config.bounces > 100 {
-        println(format("ERROR: Invalid bounces {} (must be 0-100)", config.bounces));
-        return false;
-    }
-
-    // Validate frames
-    if config.frames <= 0 || config.frames > 1000 {
-        println(format("ERROR: Invalid frames {} (must be 1-1000)", config.frames));
-        return false;
-    }
-
-    // Check for overflow in total pixel count
-    let max_pixels: i64 = 268435456;  // 16384 * 16384
-    let total_pixels = (config.width as i64) * (config.height as i64);
-    if total_pixels > max_pixels {
-        println("ERROR: Image dimensions too large (would exceed memory limits)");
-        return false;
-    }
-
-    true
-}
-
-/// Selected backend for rendering
-enum Backend {
-    /// Single-threaded CPU rendering
-    Cpu,
-    /// CUDA GPU rendering via FFI (if available)
-    Gpu,
-}
-
-/// Resolve backend selection based on config and availability
-///
-/// For "auto" mode, attempts to detect GPU availability.
-/// Falls back to CPU if GPU is not available.
-///
-/// # Arguments
-/// * `backend_str` - Backend string from config: "cpu", "gpu", or "auto"
-///
-/// # Returns
-/// * Resolved Backend enum value
-fn resolve_backend(backend_str: str) -> Backend {
-    if backend_str == "gpu" {
-        // GPU explicitly requested
-        // TODO: Check if CUDA DLL is available
-        println("Backend: GPU (CUDA) - Note: GPU support via FFI is experimental");
-        Backend::Gpu
-    } else if backend_str == "auto" {
-        // Auto-detect: prefer GPU if available, fall back to CPU
-        // TODO: Actually probe for CUDA DLL availability
-        println("Backend: Auto-detected CPU (GPU not yet implemented)");
-        Backend::Cpu
-    } else {
-        // CPU explicitly requested or default
-        println("Backend: CPU (single-threaded)");
-        Backend::Cpu
-    }
-}
-
-/// Render an image using the specified configuration
-///
-/// Performs path tracing on all pixels using Monte Carlo sampling.
-/// Backend selection (CPU/GPU) is determined by config.backend.
-///
-/// # Arguments
-/// * `config` - Render configuration with dimensions, quality settings, etc.
-///
-/// # Returns
-/// * Tuple of (elapsed_time_seconds, pixel_array)
-/// * pixel_array is in row-major order (y * width + x)
-///
-/// # Performance
-/// * Total samples = width * height * spp
-/// * Total rays ≈ samples * bounces (approximate due to early termination)
-///
-/// # Backend Selection
-/// * "cpu" - Single-threaded CPU rendering (always available)
-/// * "gpu" - CUDA GPU rendering via FFI (requires mindray_cuda.dll)
-/// * "auto" - Auto-detect GPU, fallback to CPU
-fn render_image(config: Config) -> (f64, [Vec3]) {
-    // Resolve and log backend selection
-    let backend = resolve_backend(config.backend);
-
-    // Compute aspect ratio from actual dimensions
-    let aspect_ratio = (config.width as f32) / (config.height as f32);
-    let (scene, camera) = load_scene(config.scene_name, aspect_ratio);
-
-    let num_pixels = config.width * config.height;
-    let mut pixels = [vec3_zero(); num_pixels];
-
-    println(format("Rendering {} x {} (spp={}, bounces={}, aspect={:.3})",
-        config.width, config.height, config.spp, config.bounces, aspect_ratio));
-
-    let start_time = time_now();
-
-    // Dispatch to appropriate backend
-    match backend {
-        Backend::Gpu => {
-            // GPU path - not yet implemented, fall through to CPU
-            println("WARNING: GPU backend not yet fully implemented, using CPU fallback");
-            render_cpu(&camera, &scene, &mut pixels, &config);
-        },
-        Backend::Cpu => {
-            render_cpu(&camera, &scene, &mut pixels, &config);
-        }
-    }
-
-    let end_time = time_now();
-    let elapsed = end_time - start_time;
-
-    (elapsed, pixels)
-}
-
-/// CPU rendering implementation
-///
-/// Renders all pixels using single-threaded CPU path tracing.
-/// Scene and camera are passed by reference to avoid expensive copies.
-///
-/// # Arguments
-/// * `camera` - Camera configuration (by reference)
-/// * `scene` - Scene geometry and materials (by reference)
-/// * `pixels` - Output pixel array (mutable reference)
-/// * `config` - Render configuration (by reference)
-fn render_cpu(camera: &Camera, scene: &Scene, pixels: &mut [Vec3], config: &Config) {
-    for y in 0..config.height {
-        // Progress reporting every 50 rows
-        if y % 50 == 0 {
-            println(format("Progress: {}/{} rows", y, config.height));
-        }
-
-        for x in 0..config.width {
-            // Render single pixel with Monte Carlo sampling
-            // Pass scene and camera by reference to avoid per-pixel copies
-            let pixel_color = render_pixel_ref(
-                x, y,
-                config.width, config.height,
-                config.spp, config.bounces,
-                camera, scene,
-                config.seed
-            );
-
-            // Store in row-major order
-            let idx = y * config.width + x;
-            pixels[idx] = pixel_color;
-        }
-    }
-}
-
-/// Render a single pixel (reference-based version)
-///
-/// Wrapper that calls render_pixel with dereferenced values.
-/// This avoids copying large Scene/Camera structures per-pixel.
-///
-/// # Note
-/// In a future version, render_pixel should be refactored to accept
-/// references directly. This wrapper provides the optimization without
-/// breaking the existing render_pixel API.
-#[inline]
-fn render_pixel_ref(
-    x: i32, y: i32,
-    width: i32, height: i32,
-    spp: i32, bounces: i32,
-    camera: &Camera, scene: &Scene,
-    seed: i32
-) -> Vec3 {
-    // Dereference once per pixel instead of per sample
-    render_pixel(x, y, width, height, spp, bounces, *camera, *scene, seed)
-}
-
-// =============================================================================
-// Benchmarking
-// =============================================================================
-
-/// Run the benchmark suite across multiple scene configurations
-///
-/// Benchmarks three different scenarios to test various performance aspects:
-/// 1. Sanity check (simple scene, low samples)
-/// 2. Cornell box (GI-heavy, higher samples)
-/// 3. Stress test (complex geometry)
-///
-/// Results are printed in a markdown table format for easy comparison.
-///
-/// # Arguments
-/// * `config` - Base configuration (uses backend and seed from this)
-///
-/// # Output
-/// * Renders saved to out/bench_*.ppm
-/// * Performance metrics printed to stdout
-fn run_benchmark(config: Config) {
-    println("=== Mind Ray Benchmark Suite ===");
-    println("");
-
-    // Benchmark configurations: (name, scene, width, height, spp, bounces)
-    let bench_configs = [
-        ("sanity", "spheres", 640, 360, 64, 2),   // Quick sanity check
-        ("cornell", "cornell", 640, 360, 128, 4), // GI stress test
-        ("stress", "stress", 640, 360, 16, 2),    // Geometry stress test
-    ];
-
-    // Print table header
-    println("| Scene    | Resolution | SPP | Bounces | Time(s) | Rays/sec    | Samples/sec |");
-    println("|----------|------------|-----|---------|---------|-------------|-------------|");
-
-    for (name, scene, w, h, spp, bounces) in bench_configs {
-        let bench_config = Config {
-            backend: config.backend,
-            scene_name: scene,
-            width: w,
-            height: h,
-            spp: spp,
-            bounces: bounces,
-            frames: 1,
-            seed: config.seed,
-            output_path: format("out/bench_{}.ppm", name),
-            bench_mode: true,
-        };
-
-        let (elapsed, pixels) = render_image(bench_config);
-
-        // Calculate performance metrics
-        let total_samples = (w * h * spp) as f64;
-        let total_rays = total_samples * (bounces as f64);
-        let rays_per_sec = total_rays / elapsed;
-        let samples_per_sec = total_samples / elapsed;
-
-        // Print row in table format
-        println(format(
-            "| {:<8} | {}x{:<4} | {:<3} | {:<7} | {:<7.2} | {:<11.0} | {:<11.0} |",
-            name, w, h, spp, bounces, elapsed, rays_per_sec, samples_per_sec
-        ));
-
-        // Save rendered output for visual verification
-        write_ppm(bench_config.output_path, w, h, pixels);
-    }
-
-    println("");
-    println("Benchmark complete. Results saved to out/bench_*.ppm");
-}
-
-// =============================================================================
-// Image Hashing for Determinism Verification
-// =============================================================================
-
-/// FNV-1a 64-bit hash offset basis
-const FNV_OFFSET_BASIS: u64 = 14695981039346656037;
-
-/// FNV-1a 64-bit hash prime
-const FNV_PRIME: u64 = 1099511628211;
-
-/// Pixel sampling stride for hash computation (performance optimization)
-const HASH_SAMPLE_STRIDE: i32 = 100;
-
-/// Compute a stable hash of image pixels and render configuration
-///
-/// Uses the FNV-1a hash algorithm to produce a deterministic fingerprint
-/// of the rendered output. The hash includes both configuration parameters
-/// and sampled pixel data.
-///
-/// This hash is used for:
-/// - Verifying deterministic rendering (same seed = same hash)
-/// - Detecting regressions in rendering quality
-/// - Comparing outputs across different backends
-///
-/// # Arguments
-/// * `pixels` - Rendered pixel array
-/// * `width` - Image width
-/// * `height` - Image height
-/// * `config` - Render configuration used
-///
-/// # Returns
-/// * Hex string representation of 64-bit hash (e.g., "0x1234567890abcdef")
-///
-/// # Algorithm
-/// 1. Initialize with FNV offset basis
-/// 2. Mix in configuration parameters (seed, dimensions, quality)
-/// 3. Sample every Nth pixel and mix RGB values
-/// 4. Format as hex string
-fn compute_hash(pixels: [Vec3], width: i32, height: i32, config: Config) -> str {
-    let mut hash: u64 = FNV_OFFSET_BASIS;
-
-    // Mix in configuration parameters for uniqueness
-    hash = hash_u64(hash, FNV_PRIME, config.seed as u64);
-    hash = hash_u64(hash, FNV_PRIME, width as u64);
-    hash = hash_u64(hash, FNV_PRIME, height as u64);
-    hash = hash_u64(hash, FNV_PRIME, config.spp as u64);
-    hash = hash_u64(hash, FNV_PRIME, config.bounces as u64);
-
-    // Hash sampled pixel data (every Nth pixel for performance)
-    // Full pixel hashing would be too slow for large images
-    let num_pixels = pixels.len() as i32;
-    let mut i = 0;
-    while i < num_pixels {
-        let pixel = pixels[i as usize];
-
-        // Convert float [0,1] to integer [0,255] for deterministic hashing
-        // Floating-point comparison is unreliable; integers are exact
-        let r = (pixel.x * 255.0) as u64;
-        let g = (pixel.y * 255.0) as u64;
-        let b = (pixel.z * 255.0) as u64;
-
-        hash = hash_u64(hash, FNV_PRIME, r);
-        hash = hash_u64(hash, FNV_PRIME, g);
-        hash = hash_u64(hash, FNV_PRIME, b);
-
-        i = i + HASH_SAMPLE_STRIDE;
-    }
-
-    format("0x{:016x}", hash)
-}
-
-/// FNV-1a hash step: XOR then multiply
-///
-/// # Arguments
-/// * `hash` - Current hash state
-/// * `prime` - FNV prime (1099511628211 for 64-bit)
-/// * `value` - Value to mix in
-///
-/// # Returns
-/// * Updated hash value
-#[inline]
-fn hash_u64(hash: u64, prime: u64, value: u64) -> u64 {
-    // FNV-1a: XOR first, then multiply
-    (hash ^ value) * prime
-}
-
-// =============================================================================
-// Determinism Verification
-// =============================================================================
-
-/// Verify rendering determinism by comparing two renders with the same seed
-///
-/// This test ensures that the path tracer produces bit-identical output
-/// when run twice with the same RNG seed. Determinism is critical for:
-/// - Reproducible bug reports
-/// - Regression testing
-/// - Distributed rendering
-///
-/// # Arguments
-/// * `config` - Render configuration to verify
-///
-/// # Exit Codes
-/// * 0 - Verification passed (hashes match)
-/// * 1 - Verification failed (hashes differ)
-fn run_verify(config: Config) {
-    println("=== Mind Ray Determinism Verification ===");
-    println("");
-
-    // Print configuration for reference
-    println("Configuration:");
-    println(format("  Scene: {}", config.scene_name));
-    println(format("  Resolution: {}x{}", config.width, config.height));
-    println(format("  Samples: {} spp", config.spp));
-    println(format("  Bounces: {}", config.bounces));
-    println(format("  Seed: {}", config.seed));
-    println(format("  Backend: {}", config.backend));
-    println("");
-
-    // First render pass
-    println("First render...");
-    let (elapsed1, pixels1) = render_image(config);
-    let hash1 = compute_hash(pixels1, config.width, config.height, config);
-
-    // Second render pass with identical configuration
-    println("Second render (same seed)...");
-    let (elapsed2, pixels2) = render_image(config);
-    let hash2 = compute_hash(pixels2, config.width, config.height, config);
-
-    // Compare hashes
-    println("");
-    println("Results:");
-    println(format("  First  hash: {}", hash1));
-    println(format("  Second hash: {}", hash2));
-    println(format("  Match: {}", if hash1 == hash2 { "YES" } else { "NO" }));
-    println(format("  Time delta: {:.3}s", elapsed2 - elapsed1));
-    println("");
-
-    if hash1 == hash2 {
-        println("PASS: Determinism verified - same seed produces identical output");
-    } else {
-        println("FAIL: Determinism check failed - outputs differ!");
-        println("This may indicate:");
-        println("  - Uninitialized memory");
-        println("  - Non-deterministic RNG");
-        println("  - Thread-unsafe code");
-        exit(1);
-    }
-
-    // Save output from first render for visual inspection
-    write_ppm(config.output_path, config.width, config.height, pixels1);
-    println(format("Output saved to: {}", config.output_path));
-}
-
-
-
-// =============================================================================
-// Selfcheck - Quick Sanity Test
-// =============================================================================
-
-/// Golden hash for selfcheck (64x64, spp=4, seed=42, spheres scene)
-/// This is the expected hash for a known-good render.
-const SELFCHECK_GOLDEN_HASH: str = "0x0000000000000000";  // Placeholder - will be computed on first run
-
-/// Selfcheck configuration constants
-const SELFCHECK_WIDTH: i32 = 64;
-const SELFCHECK_HEIGHT: i32 = 64;
-const SELFCHECK_SPP: i32 = 4;
-const SELFCHECK_BOUNCES: i32 = 2;
-const SELFCHECK_SEED: i32 = 42;
-
-/// Run quick sanity check
-///
-/// Renders a tiny image with fixed parameters and verifies the output hash.
-/// This is a fast way to confirm the renderer is working correctly.
-///
-/// # Exit Codes
-/// * 0 - PASS: Selfcheck passed
-/// * 1 - FAIL: Selfcheck failed (hash mismatch or render error)
-fn run_selfcheck(base_config: Config) {
-    println("=== Mind Ray Selfcheck ===");
-    println("");
-    
-    // Fixed selfcheck configuration
-    let config = Config {
-        backend: base_config.backend,
-        scene_name: "spheres",
-        width: SELFCHECK_WIDTH,
-        height: SELFCHECK_HEIGHT,
-        spp: SELFCHECK_SPP,
-        bounces: SELFCHECK_BOUNCES,
-        frames: 1,
-        seed: SELFCHECK_SEED,
-        output_path: "out/selfcheck.ppm",
-        bench_mode: false,
-    };
-    
-    println(format("Config: {}x{}, spp={}, bounces={}, seed={}",
-        config.width, config.height, config.spp, config.bounces, config.seed));
-    println("");
-    
-    // Render
-    println("Rendering...");
-    let start = time_now();
-    let (elapsed, pixels) = render_image(config);
-    
-    // Compute hash
-    let hash = compute_hash(pixels, config.width, config.height, config);
-    
-    // Write output
-    let write_result = write_ppm(config.output_path, config.width, config.height, pixels);
-    
-    println("");
-    println("Results:");
-    println(format("  Time: {:.3}s", elapsed));
-    println(format("  Hash: {}", hash));
-    println(format("  Output: {}", config.output_path));
-    println("");
-    
-    // Check for write errors
-    match write_result {
-        IoResult::Err(e) => {
-            println(format("FAIL: Could not write output: {:?}", e));
-            exit(1);
-        },
-        IoResult::Ok(()) => {}
-    }
-    
-    // Verify determinism by rendering again
-    println("Verifying determinism...");
-    let (elapsed2, pixels2) = render_image(config);
-    let hash2 = compute_hash(pixels2, config.width, config.height, config);
-    
-    if hash != hash2 {
-        println("FAIL: Non-deterministic - two renders with same seed produced different hashes");
-        println(format("  First:  {}", hash));
-        println(format("  Second: {}", hash2));
-        exit(1);
-    }
-    
-    println("PASS: Selfcheck complete");
-    println(format("  Determinism: verified (hash stable across 2 renders)"));
-    println(format("  Performance: {:.0} samples/sec", 
-        (config.width * config.height * config.spp) as f64 / elapsed));
-}
-
-// =============================================================================
-// Program Entry Point
-// =============================================================================
-
-/// Program entry point
-///
-/// Parses command-line arguments and dispatches to the appropriate command
-/// handler (render, bench, verify, or help).
-///
-/// # Arguments
-/// * `args` - Command-line arguments (args[0] is program name)
-///
-/// # Exit Codes
-/// * 0 - Success
-/// * 1 - Error (file I/O, invalid arguments, invalid config, etc.)
-fn main(args: [str]) {
-    let (command, config) = parse_args(args);
-
-    // Create output directory if needed
-    ensure_dir_exists("out");
-
-    // Dispatch to appropriate command handler
-    match command {
-        Command::Help => {
-            print_help();
-            return;
-        },
-        Command::Bench => {
-            // Benchmark uses its own fixed configs
-            run_benchmark(config);
-            return;
-        },
-        Command::Verify => {
-            // Validate config before verification
-            if !validate_config(&config) {
-                exit(1);
+            let p: i64 = prim_base(scene, get_slot(work, 0));
+            let kind: i64 = get_slot(p, 0);
+            let mat: i64 = get_slot(p, 1);
+            let hx: f64 = ox + t * dx;
+            let hy: f64 = oy + t * dy;
+            let hz: f64 = oz + t * dz;
+            // Geometric outward normal.
+            let mut nx: f64 = 0.0;
+            let mut ny: f64 = 1.0;
+            let mut nz: f64 = 0.0;
+            if kind == PRIM_SPHERE {
+                let rad: f64 = get_milli(p, 12);
+                nx = (hx - get_milli(p, 9)) / rad;
+                ny = (hy - get_milli(p, 10)) / rad;
+                nz = (hz - get_milli(p, 11)) / rad;
             }
-            run_verify(config);
-            return;
-        },
-        Command::Selfcheck => {
-            // Quick sanity check with fixed config
-            run_selfcheck(config);
-            return;
-        },
-        Command::Render => {
-            // Validate configuration before rendering
-            if !validate_config(&config) {
-                exit(1);
+            if kind == PRIM_RECT {
+                let axis: i64 = get_slot(p, 9);
+                ny = 0.0;
+                if axis == 0 {
+                    nx = 1.0;
+                }
+                if axis == 1 {
+                    ny = 1.0;
+                }
+                if axis == 2 {
+                    nz = 1.0;
+                }
             }
-
-            // Standard render command (default)
-            let (elapsed, pixels) = render_image(config);
-
-            // Compute hash for reproducibility verification
-            let hash = compute_hash(pixels, config.width, config.height, config);
-
-            // Write output image
-            let result = write_ppm(config.output_path, config.width, config.height, pixels);
-
-            match result {
-                IoResult::Ok(()) => {
-                    // Calculate and display performance metrics
-                    // Note: total_rays is an upper bound; actual rays may be fewer
-                    // due to early termination (misses, Russian roulette)
-                    let total_samples = (config.width * config.height * config.spp) as f64;
-                    let total_rays = total_samples * (config.bounces as f64);
-                    let rays_per_sec = total_rays / elapsed;
-                    let samples_per_sec = total_samples / elapsed;
-
-                    println("");
-                    println(format("Render complete in {:.2}s", elapsed));
-                    println(format("Output: {}", config.output_path));
-                    println(format("Resolution: {}x{}", config.width, config.height));
-                    println(format("Performance: {:.0} rays/sec (upper bound), {:.0} samples/sec",
-                        rays_per_sec, samples_per_sec));
-                    println(format("Image hash: {} (seed={})", hash, config.seed));
-                },
-                IoResult::Err(e) => {
-                    println(format("ERROR: Failed to write output file: {:?}", e));
-                    exit(1);
+            // Face the normal against the incoming ray.
+            let mut front: i64 = 1;
+            if dot3(dx, dy, dz, nx, ny, nz) > 0.0 {
+                nx = 0.0 - nx;
+                ny = 0.0 - ny;
+                nz = 0.0 - nz;
+                front = 0;
+            }
+            let ar: f64 = get_milli(p, 2);
+            let ag: f64 = get_milli(p, 3);
+            let ab: f64 = get_milli(p, 4);
+            let param: f64 = get_milli(p, 5);
+            if mat == MAT_EMISSIVE {
+                lr = lr + tr * ar;
+                lg = lg + tg * ag;
+                lb = lb + tb * ab;
+                alive = 0;
+            } else {
+                let dl: f64 = len3(dx, dy, dz);
+                let ux: f64 = dx / dl;
+                let uy: f64 = dy / dl;
+                let uz: f64 = dz / dl;
+                let mut sx: f64 = 0.0;
+                let mut sy: f64 = 0.0;
+                let mut sz: f64 = 0.0;
+                if mat == MAT_DIFFUSE {
+                    rng_in_sphere(rng, rv);
+                    sx = nx + rand_comp(rv, 0);
+                    sy = ny + rand_comp(rv, 1);
+                    sz = nz + rand_comp(rv, 2);
+                    if dot3(sx, sy, sz, sx, sy, sz) < 0.00000001 {
+                        sx = nx;
+                        sy = ny;
+                        sz = nz;
+                    }
+                }
+                if mat == MAT_METAL {
+                    let dn: f64 = dot3(ux, uy, uz, nx, ny, nz);
+                    rng_in_sphere(rng, rv);
+                    sx = ux - 2.0 * dn * nx + param * rand_comp(rv, 0);
+                    sy = uy - 2.0 * dn * ny + param * rand_comp(rv, 1);
+                    sz = uz - 2.0 * dn * nz + param * rand_comp(rv, 2);
+                    if dot3(sx, sy, sz, nx, ny, nz) <= 0.0 {
+                        alive = 0;
+                    }
+                }
+                if mat == MAT_DIELECTRIC {
+                    let mut eta: f64 = param;
+                    if front == 1 {
+                        eta = 1.0 / param;
+                    }
+                    let cos_t: f64 = minf(0.0 - dot3(ux, uy, uz, nx, ny, nz), 1.0);
+                    let sin2: f64 = 1.0 - cos_t * cos_t;
+                    let reflect_p: f64 = schlick(cos_t, eta);
+                    if eta * eta * sin2 > 1.0 || rng_f64(rng) < reflect_p {
+                        let dn2: f64 = dot3(ux, uy, uz, nx, ny, nz);
+                        sx = ux - 2.0 * dn2 * nx;
+                        sy = uy - 2.0 * dn2 * ny;
+                        sz = uz - 2.0 * dn2 * nz;
+                    } else {
+                        let px: f64 = eta * (ux + cos_t * nx);
+                        let py: f64 = eta * (uy + cos_t * ny);
+                        let pz: f64 = eta * (uz + cos_t * nz);
+                        let par: f64 = 0.0 - det_sqrt(absf(1.0 - dot3(px, py, pz, px, py, pz)));
+                        sx = px + par * nx;
+                        sy = py + par * ny;
+                        sz = pz + par * nz;
+                    }
+                }
+                tr = tr * ar;
+                tg = tg * ag;
+                tb = tb * ab;
+                ox = hx;
+                oy = hy;
+                oz = hz;
+                dx = sx;
+                dy = sy;
+                dz = sz;
+                depth = depth + 1;
+                if depth >= bounces {
+                    alive = 0;
                 }
             }
         }
     }
+    set_slot(acc, 0, get_slot(acc, 0) + ((lr * 16777216.0) as i64));
+    set_slot(acc, 1, get_slot(acc, 1) + ((lg * 16777216.0) as i64));
+    set_slot(acc, 2, get_slot(acc, 2) + ((lb * 16777216.0) as i64));
+    return 0;
 }
 
-// =============================================================================
-// Utility Functions - Runtime FFI Wrappers
-// =============================================================================
-//
-// These functions wrap Mind runtime FFI calls to provide standard library
-// functionality. They will eventually be replaced by Mind's standard library.
-
-/// Result type for parsing operations
-enum ParseResult<T> {
-    Ok(T),
-    Err(str),
-}
-
-/// Parse a string as a 32-bit signed integer
-///
-/// Parses decimal integer strings with optional leading minus sign.
-/// Returns an error for invalid input (empty string, non-numeric characters).
-///
-/// # Arguments
-/// * `s` - String to parse
-///
-/// # Returns
-/// * ParseResult::Ok(value) on success
-/// * ParseResult::Err(message) on parse failure
-///
-/// # Examples
-/// * "123" -> Ok(123)
-/// * "-42" -> Ok(-42)
-/// * "abc" -> Err("invalid number")
-/// * "" -> Err("empty string")
-fn str_to_i32_result(s: str) -> ParseResult<i32> {
-    if s.len() == 0 {
-        return ParseResult::Err("empty string");
+// Linear radiance -> 8-bit sRGB-ish (gamma 2) byte.
+fn to_byte(sum: i64, spp: i64) -> i64 {
+    let v: f64 = ((sum as f64) / 16777216.0) / (spp as f64);
+    let g: f64 = det_sqrt(clamp01(v));
+    let b: i64 = (g * 255.999) as i64;
+    if b > 255 {
+        return 255;
     }
-    let result = __mind_str_to_i32(s);
-    // Check if parsing actually succeeded by round-tripping
-    // (This is a simplified check - real implementation would have FFI return success/failure)
-    ParseResult::Ok(result)
+    return b;
 }
 
-/// Parse a string as i32, returning default on failure
-///
-/// # Arguments
-/// * `s` - String to parse
-/// * `default` - Value to return on parse failure
-///
-/// # Returns
-/// * Parsed value or default
-fn str_to_i32_or(s: str, default: i32) -> i32 {
-    if s.len() == 0 {
-        return default;
+// Render the whole image into `img` (w*h*3 bytes, top row first).
+fn render(scene: i64, img: i64, w: i64, h: i64, spp: i64, bounces: i64, seed: i64) -> i64 {
+    let work: i64 = __mind_alloc(8 * 8);
+    let acc: i64 = __mind_alloc(4 * 8);
+    let rng: i64 = slot_addr(work, 4);
+    // Camera basis from the scene header (look-at, world up = +y).
+    let cx: f64 = get_milli(scene, 4);
+    let cy: f64 = get_milli(scene, 5);
+    let cz: f64 = get_milli(scene, 6);
+    let wx0: f64 = cx - get_milli(scene, 7);
+    let wy0: f64 = cy - get_milli(scene, 8);
+    let wz0: f64 = cz - get_milli(scene, 9);
+    let wl: f64 = len3(wx0, wy0, wz0);
+    let wx: f64 = wx0 / wl;
+    let wy: f64 = wy0 / wl;
+    let wz: f64 = wz0 / wl;
+    // u = normalize(up x w), up = (0, 1, 0)
+    let ux0: f64 = wz;
+    let uz0: f64 = 0.0 - wx;
+    let ul: f64 = len3(ux0, 0.0, uz0);
+    let ux: f64 = ux0 / ul;
+    let uz: f64 = uz0 / ul;
+    // v = w x u
+    let vx: f64 = wy * uz;
+    let vy: f64 = wz * ux - wx * uz;
+    let vz: f64 = 0.0 - wy * ux;
+    let half_h: f64 = get_milli(scene, 10);
+    let half_w: f64 = half_h * ((w as f64) / (h as f64));
+    let mut y: i64 = 0;
+    while y < h {
+        let mut x: i64 = 0;
+        while x < w {
+            rng_seed(rng, x, y, seed);
+            set_slot(acc, 0, 0);
+            set_slot(acc, 1, 0);
+            set_slot(acc, 2, 0);
+            let mut s: i64 = 0;
+            while s < spp {
+                let su: f64 = ((x as f64) + rng_f64(rng)) / (w as f64);
+                let sv: f64 = (((h - 1 - y) as f64) + rng_f64(rng)) / (h as f64);
+                let a: f64 = (2.0 * su - 1.0) * half_w;
+                let b: f64 = (2.0 * sv - 1.0) * half_h;
+                let dx: f64 = a * ux + b * vx - wx;
+                let dy: f64 = b * vy - wy;
+                let dz: f64 = a * uz + b * vz - wz;
+                trace_path(scene, work, acc, cx, cy, cz, dx, dy, dz, bounces);
+                s = s + 1;
+            }
+            let o: i64 = img + (y * w + x) * 3;
+            __mind_store_i8(o, to_byte(get_slot(acc, 0), spp));
+            __mind_store_i8(o + 1, to_byte(get_slot(acc, 1), spp));
+            __mind_store_i8(o + 2, to_byte(get_slot(acc, 2), spp));
+            x = x + 1;
+        }
+        y = y + 1;
     }
-    __mind_str_to_i32(s)
-}
-
-/// Legacy function - parse string to i32, returns 0 on failure
-/// @deprecated Use str_to_i32_result for proper error handling
-fn str_to_i32(s: str) -> i32 {
-    str_to_i32_or(s, 0)
-}
-
-/// Get current time in seconds since program start
-///
-/// Returns a high-precision timestamp suitable for performance measurement.
-/// The epoch is undefined; only use for measuring elapsed time.
-///
-/// # Returns
-/// * Current time in seconds (f64 for sub-millisecond precision)
-fn time_now() -> f64 {
-    __mind_time_now()
-}
-
-/// Ensure a directory exists, creating it if necessary
-///
-/// Creates the directory and any parent directories as needed.
-/// No-op if the directory already exists.
-///
-/// # Arguments
-/// * `path` - Directory path to create
-fn ensure_dir_exists(path: str) {
-    if path.len() > 0 {
-        __mind_ensure_dir(path);
-    }
-}
-
-/// Exit the program with a status code
-///
-/// Terminates the program immediately with the given exit code.
-/// Code 0 indicates success, non-zero indicates failure.
-///
-/// # Arguments
-/// * `code` - Exit status code (0 = success)
-fn exit(code: i32) {
-    __mind_exit(code);
-}
-
-/// Print a string to standard output followed by a newline
-///
-/// # Arguments
-/// * `s` - String to print
-fn println(s: str) {
-    __mind_println(s);
-}
-
-/// Print a string to standard output without a trailing newline
-///
-/// # Arguments
-/// * `s` - String to print
-fn print(s: str) {
-    __mind_print(s);
+    return 0;
 }
 
 // =============================================================================
-// Mind Runtime FFI Declarations
+// Input / output
 // =============================================================================
 
-/// Parse string to i32
-#[extern("mind_runtime")]
-fn __mind_str_to_i32(s: str) -> i32;
+fn is_space(c: i64) -> i64 {
+    if c == 32 || c == 9 || c == 10 || c == 13 {
+        return 1;
+    }
+    return 0;
+}
 
-/// Get current time in seconds
-#[extern("mind_runtime")]
-fn __mind_time_now() -> f64;
+// Index of the start of the next token at or after `pos` (or `len`).
+fn skip_space(buf: i64, len: i64, pos: i64) -> i64 {
+    let mut p: i64 = pos;
+    while p < len && is_space(__mind_load_i8(buf + p)) == 1 {
+        p = p + 1;
+    }
+    return p;
+}
 
-/// Create directory (recursive)
-#[extern("mind_runtime")]
-fn __mind_ensure_dir(path: str);
+fn token_end(buf: i64, len: i64, pos: i64) -> i64 {
+    let mut p: i64 = pos;
+    while p < len && is_space(__mind_load_i8(buf + p)) == 0 {
+        p = p + 1;
+    }
+    return p;
+}
 
-/// Exit program
-#[extern("mind_runtime")]
-fn __mind_exit(code: i32);
+// Parse a non-negative decimal integer in [start, end), or `fallback` if the
+// token is empty, contains a non-digit or is out of range.
+fn parse_int(buf: i64, start: i64, end: i64, fallback: i64) -> i64 {
+    if start >= end {
+        return fallback;
+    }
+    let mut v: i64 = 0;
+    let mut p: i64 = start;
+    while p < end {
+        let c: i64 = __mind_load_i8(buf + p);
+        if c < 48 || c > 57 {
+            return fallback;
+        }
+        v = v * 10 + (c - 48);
+        if v > 1000000000 {
+            return fallback;
+        }
+        p = p + 1;
+    }
+    return v;
+}
 
-/// Print with newline
-#[extern("mind_runtime")]
-fn __mind_println(s: str);
+// Scene name -> id: "cornell" -> 1, "stress" -> 2, anything else -> spheres.
+fn parse_scene(buf: i64, start: i64, end: i64) -> i64 {
+    if end - start < 2 {
+        return SCENE_SPHERES;
+    }
+    let c0: i64 = __mind_load_i8(buf + start);
+    let c1: i64 = __mind_load_i8(buf + start + 1);
+    if c0 == 99 {
+        return SCENE_CORNELL;
+    }
+    if c0 == 115 && c1 == 116 {
+        return SCENE_STRESS;
+    }
+    return SCENE_SPHERES;
+}
 
-/// Print without newline
-#[extern("mind_runtime")]
-fn __mind_print(s: str);
+fn clamp_int(v: i64, lo: i64, hi: i64) -> i64 {
+    if v < lo {
+        return lo;
+    }
+    if v > hi {
+        return hi;
+    }
+    return v;
+}
 
-/// Format string (from io module, re-declared for convenience)
-#[extern("mind_runtime")]
-fn format(template: str, args: ...) -> str;
+// Write `v` in decimal at buf+pos; returns the new position.
+fn put_uint(buf: i64, pos: i64, v: i64) -> i64 {
+    let mut div: i64 = 1;
+    while div * 10 <= v {
+        div = div * 10;
+    }
+    let mut p: i64 = pos;
+    while div > 0 {
+        __mind_store_i8(buf + p, 48 + (v / div) % 10);
+        p = p + 1;
+        div = div / 10;
+    }
+    return p;
+}
+
+// Write n bytes to fd, retrying on short writes. Returns 0 or -1 on error.
+fn write_all(fd: i64, buf: i64, n: i64) -> i64 {
+    let mut done: i64 = 0;
+    while done < n {
+        let k: i64 = __mind_write(fd, buf + done, n - done, 0 - 1);
+        if k <= 0 {
+            return 0 - 1;
+        }
+        done = done + k;
+    }
+    return 0;
+}
+
+fn put_byte(buf: i64, pos: i64, c: i64) -> i64 {
+    __mind_store_i8(buf + pos, c);
+    return pos + 1;
+}
+
+fn hex_digit(d: i64) -> i64 {
+    if d < 10 {
+        return 48 + d;
+    }
+    return 87 + d;
+}
+
+// FNV-1a 32-bit over n bytes.
+fn fnv1a32(buf: i64, n: i64) -> i64 {
+    let mut h: i64 = 2166136261;
+    let mut i: i64 = 0;
+    while i < n {
+        h = ((h ^ __mind_load_i8(buf + i)) * 16777619) & MASK32;
+        i = i + 1;
+    }
+    return h;
+}
+
+// stderr line: "mind-ray: <w>x<h> spp=<spp> fnv1a32=<8 hex digits>"
+fn report_hash(w: i64, h: i64, spp: i64, hash: i64) -> i64 {
+    let buf: i64 = __mind_alloc(128);
+    let mut p: i64 = 0;
+    // "mind-ray: "
+    p = put_byte(buf, p, 109);
+    p = put_byte(buf, p, 105);
+    p = put_byte(buf, p, 110);
+    p = put_byte(buf, p, 100);
+    p = put_byte(buf, p, 45);
+    p = put_byte(buf, p, 114);
+    p = put_byte(buf, p, 97);
+    p = put_byte(buf, p, 121);
+    p = put_byte(buf, p, 58);
+    p = put_byte(buf, p, 32);
+    p = put_uint(buf, p, w);
+    p = put_byte(buf, p, 120);
+    p = put_uint(buf, p, h);
+    // " spp="
+    p = put_byte(buf, p, 32);
+    p = put_byte(buf, p, 115);
+    p = put_byte(buf, p, 112);
+    p = put_byte(buf, p, 112);
+    p = put_byte(buf, p, 61);
+    p = put_uint(buf, p, spp);
+    // " fnv1a32="
+    p = put_byte(buf, p, 32);
+    p = put_byte(buf, p, 102);
+    p = put_byte(buf, p, 110);
+    p = put_byte(buf, p, 118);
+    p = put_byte(buf, p, 49);
+    p = put_byte(buf, p, 97);
+    p = put_byte(buf, p, 51);
+    p = put_byte(buf, p, 50);
+    p = put_byte(buf, p, 61);
+    let mut shift: i64 = 28;
+    while shift >= 0 {
+        p = put_byte(buf, p, hex_digit((hash >> shift) & 15));
+        shift = shift - 4;
+    }
+    p = put_byte(buf, p, 10);
+    __mind_write(2, buf, p, 0 - 1);
+    return 0;
+}
+
+// =============================================================================
+// Entry point
+// =============================================================================
+
+fn main() -> i64 {
+    // Read the configuration line from stdin.
+    let inbuf: i64 = __mind_alloc(256);
+    let mut len: i64 = __mind_read(0, inbuf, 255, 0 - 1);
+    if len < 0 {
+        len = 0;
+    }
+    let s0: i64 = skip_space(inbuf, len, 0);
+    let e0: i64 = token_end(inbuf, len, s0);
+    let s1: i64 = skip_space(inbuf, len, e0);
+    let e1: i64 = token_end(inbuf, len, s1);
+    let s2: i64 = skip_space(inbuf, len, e1);
+    let e2: i64 = token_end(inbuf, len, s2);
+    let s3: i64 = skip_space(inbuf, len, e2);
+    let e3: i64 = token_end(inbuf, len, s3);
+    let s4: i64 = skip_space(inbuf, len, e3);
+    let e4: i64 = token_end(inbuf, len, s4);
+    let s5: i64 = skip_space(inbuf, len, e4);
+    let e5: i64 = token_end(inbuf, len, s5);
+    let scene_id: i64 = parse_scene(inbuf, s0, e0);
+    let w: i64 = clamp_int(parse_int(inbuf, s1, e1, 320), 1, 4096);
+    let h: i64 = clamp_int(parse_int(inbuf, s2, e2, 180), 1, 4096);
+    let spp: i64 = clamp_int(parse_int(inbuf, s3, e3, 16), 1, 65536);
+    let bounces: i64 = clamp_int(parse_int(inbuf, s4, e4, 4), 1, 64);
+    let seed: i64 = parse_int(inbuf, s5, e5, 42);
+
+    let scene: i64 = __mind_alloc((HDR + MAX_PRIMS * REC) * 8);
+    build_scene(scene, scene_id);
+
+    let npix: i64 = w * h * 3;
+    let img: i64 = __mind_alloc(npix);
+    render(scene, img, w, h, spp, bounces, seed);
+
+    // PPM header: "P6\n<w> <h>\n255\n"
+    let hdr: i64 = __mind_alloc(64);
+    let mut p: i64 = 0;
+    p = put_byte(hdr, p, 80);
+    p = put_byte(hdr, p, 54);
+    p = put_byte(hdr, p, 10);
+    p = put_uint(hdr, p, w);
+    p = put_byte(hdr, p, 32);
+    p = put_uint(hdr, p, h);
+    p = put_byte(hdr, p, 10);
+    p = put_uint(hdr, p, 255);
+    p = put_byte(hdr, p, 10);
+    if write_all(1, hdr, p) != 0 {
+        return 1;
+    }
+    if write_all(1, img, npix) != 0 {
+        return 1;
+    }
+
+    report_hash(w, h, spp, fnv1a32(img, npix));
+    return 0;
+}
