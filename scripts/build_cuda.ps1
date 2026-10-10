@@ -1,8 +1,8 @@
 # build_cuda.ps1 - Build CUDA GPU backend for Mind Ray
 #
 # Requirements:
-# - CUDA Toolkit 12.x (nvcc in PATH)
-# - Visual Studio 2022 Build Tools (MSVC)
+# - CUDA Toolkit 12.8 or newer (nvcc in PATH); CI compiles with CUDA 13.4
+# - Visual Studio Build Tools with the MSVC x64 toolset
 #
 # Usage: .\scripts\build_cuda.ps1 [-Debug] [-Clean]
 #
@@ -15,10 +15,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-if (-not $ProjectRoot) {
-    $ProjectRoot = Split-Path -Parent $PSScriptRoot
-}
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
 $NativeCudaDir = Join-Path $ProjectRoot "native-cuda"
 $SourceFile = Join-Path $NativeCudaDir "mindray_cuda.cu"
 $OutputDll = Join-Path $NativeCudaDir "mindray_cuda.dll"
@@ -42,24 +39,26 @@ if ($Clean) {
     }
 }
 
-# Set up Visual Studio environment if cl.exe not in PATH
+# Set up the Visual Studio (MSVC) environment if cl.exe is not on PATH.
+# vswhere ships with every Visual Studio 2017+ / Build Tools install.
 $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
 if (-not $cl) {
-    Write-Host "Setting up Visual Studio environment..." -ForegroundColor Yellow
-    $vsPath = "C:\Program Files\Microsoft Visual Studio2\Preview"
-    if (-not (Test-Path $vsPath)) {
-        $vsPath = "C:\Program Files\Microsoft Visual Studio2\Community"
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    $vsPath = $null
+    if (Test-Path $vswhere) {
+        $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
     }
-    if (-not (Test-Path $vsPath)) {
-        $vsPath = "C:\Program Files\Microsoft Visual Studio2\Professional"
-    }
-
-    $vcvarsall = Join-Path $vsPath "VC\Auxiliary\Buildcvarsall.bat"
-    if (Test-Path $vcvarsall) {
-        cmd /c ""$vcvarsall" x64 >nul 2>&1"
-        Write-Host "VS environment: $vsPath" -ForegroundColor Gray
+    $vcvars = if ($vsPath) { Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat" } else { $null }
+    if ($vcvars -and (Test-Path $vcvars)) {
+        Write-Host "Setting up Visual Studio environment: $vsPath" -ForegroundColor Yellow
+        cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
+            if ($_ -match "^([^=]+)=(.*)$") {
+                [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+            }
+        }
     } else {
-        Write-Host "WARNING: Could not find vcvarsall.bat" -ForegroundColor Yellow
+        Write-Host "ERROR: cl.exe not found. Run from a Developer PowerShell for Visual Studio." -ForegroundColor Red
+        exit 1
     }
 }
 
@@ -86,10 +85,11 @@ $CommonFlags = @(
     "-shared",
     "-Xcompiler", "/MD",
     "-Xcompiler", "/W3",
-    "-arch=sm_75",          # Turing (RTX 20xx) and newer
-    "-gencode=arch=compute_75,code=sm_75",
-    "-gencode=arch=compute_86,code=sm_86",  # Ampere (RTX 30xx)
-    "-gencode=arch=compute_89,code=sm_89",  # Ada Lovelace (RTX 40xx)
+    "-gencode=arch=compute_75,code=sm_75",    # Turing (RTX 20xx)
+    "-gencode=arch=compute_86,code=sm_86",    # Ampere (RTX 30xx)
+    "-gencode=arch=compute_89,code=sm_89",    # Ada Lovelace (RTX 40xx)
+    "-gencode=arch=compute_120,code=sm_120",  # Blackwell (RTX 50xx)
+    "-gencode=arch=compute_120,code=compute_120",  # PTX for newer GPUs
     "--expt-relaxed-constexpr",
     "-D_CRT_SECURE_NO_WARNINGS"
 )
@@ -154,4 +154,4 @@ Write-Host "Exported functions:" -ForegroundColor Cyan
 }
 
 Write-Host ""
-Write-Host "To use from Mind, copy mindray_cuda.dll to your build output directory." -ForegroundColor Yellow
+Write-Host "Load mindray_cuda.dll from the benchmark host (bench\cuda_benchmark.c)." -ForegroundColor Yellow

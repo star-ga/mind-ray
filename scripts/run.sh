@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# run.sh - Run Mind Ray Tracer on Linux/macOS
+# run.sh - Render one image with the MIND renderer.
+#
+# Usage: ./scripts/run.sh [scene] [width] [height] [spp] [bounces] [seed]
+#   scene: spheres | cornell | stress          (default: spheres)
+# Writes out/<scene>.ppm and prints the image hash line on stderr.
 
 set -euo pipefail
 
-EXE="bin/mind-ray"
+scene="${1:-spheres}"
+width="${2:-320}"
+height="${3:-180}"
+spp="${4:-16}"
+bounces="${5:-4}"
+seed="${6:-42}"
+exe="target/release/mind-ray"
 
-if [[ ! -f "$EXE" ]]; then
-    echo "ERROR: Binary not found. Build first with: ./scripts/build.sh"
+if [ ! -x "$exe" ]; then
+    echo "error: $exe not found; build first with ./scripts/build.sh" >&2
     exit 1
 fi
 
-# Default parameters (can be overridden with args)
-if [[ $# -eq 0 ]]; then
-    exec "$EXE" \
-        --scene spheres \
-        --width 800 \
-        --height 450 \
-        --spp 16 \
-        --bounces 4 \
-        --seed 1 \
-        --out out/render.ppm
-else
-    exec "$EXE" "$@"
-fi
+mkdir -p out
+echo "$scene $width $height $spp $bounces $seed" | "$exe" > "out/$scene.ppm"
+echo "Wrote out/$scene.ppm"
