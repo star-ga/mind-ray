@@ -4,6 +4,12 @@ All notable changes to MIND-Ray are documented in this file.
 
 ## [0.2.0] - 2026-10-10
 
+### Fixed
+- `scripts/build.sh` builds with the public `mindc` release alone: it emits the
+  renderer as a cdylib and links the executable with `clang`, since
+  `--emit binary` needs the MIND CPU runtime library, which the release
+  archive does not ship. CI failed on this. Image hashes are unchanged.
+
 ### Changed
 - **MIND renderer rewritten for mindc v0.10.2.** `src/main.mind` is a single
   module in the executable subset of the released compiler: f64 scalars,

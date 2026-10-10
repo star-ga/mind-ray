@@ -38,10 +38,18 @@ distribution does not ship `mlir-opt`, build under WSL with the `.sh` scripts.
 `scripts/build.sh` uses, in order: `$MINDC`, `./toolchain/mindc`, then `mindc`
 on `PATH`.
 
+The public `mindc` release emits an executable directly only when the MIND
+CPU runtime library is installed, which the release archive does not include
+(`error[build]: MIND runtime not found for backend 'cpu'`). `scripts/build.sh`
+therefore builds the renderer with `--emit cdylib` (needs only libc) and links
+`target/release/mind-ray` around the module's exported `main` with `clang`;
+the executable loads `libmind-ray.so` from its own directory. The output is
+bit-identical, so the recorded hashes are unchanged.
+
 ### Build, run, test
 
 ```bash
-./scripts/build.sh                          # mindc check src/ && mindc build --release
+./scripts/build.sh                          # mindc check, mindc build --emit cdylib, link with clang
 ./scripts/run.sh spheres 320 180 16 4 42    # out/spheres.ppm
 ./scripts/test.sh                           # recorded image hashes for all scenes
 ```
@@ -50,6 +58,7 @@ on `PATH`.
 
 | Message | Fix |
 |---------|-----|
+| `MIND runtime not found for backend 'cpu'` | You ran `mindc build` without `--emit cdylib`; use `./scripts/build.sh` |
 | `MLIR build failed: ... mlir-opt` not found | Install the MLIR tools and put them on `PATH` (see above) |
 | `fmt::drift` from `mindc check` | Run `mindc fmt src/main.mind` |
 | `FAIL <scene> fnv1a32=...` from `scripts/test.sh` | The renderer output changed; if intended, update the recorded hashes in `scripts/test.sh` |

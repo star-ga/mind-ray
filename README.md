@@ -69,7 +69,7 @@ export PATH=/usr/lib/llvm-20/bin:$PATH
 
 ./scripts/get_mindc.sh        # downloads mindc v0.10.2, verifies its SHA-256, installs ./toolchain/mindc
 ./scripts/check_toolchain.sh  # mindc, mlir-opt, mlir-translate, clang
-./scripts/build.sh            # mindc check src/ && mindc build --release
+./scripts/build.sh            # mindc check, mindc build --emit cdylib, link with clang
 ./scripts/run.sh cornell 360 360 256 6 42
 python3 scripts/ppm_to_png.py out/cornell.ppm out/cornell.png
 ./scripts/test.sh             # rebuilds and checks the recorded image hashes
