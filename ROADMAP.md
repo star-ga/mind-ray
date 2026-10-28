@@ -19,3 +19,12 @@ project: the GPU render comes from the MIND source.
 3. **Benchmark honesty.** Until item 1 passes, every published MIND-Ray GPU number
    is labelled as the CUDA reference kernel's number, and the MIND renderer's
    numbers are CPU numbers.
+## Research watch — implicit field / SDF rendering (2026-10-28)
+
+**Status: proposed for architectural review; NOT APPROVED, implemented, or release-qualified.** Existing CPU/GPU provenance gates take precedence.
+
+Explore an optional CPU-first MIND renderer path for analytic signed-distance and implicit fields: sphere, box, plane, translation, CSG union/min, intersection/max, difference/max with negation, and ray marching/sphere tracing. Preserve current path-tracer scenes and image-hash fixtures.
+
+Review sign convention, coordinates, step safety factors, Lipschitz bounds, hit/miss thresholds, normals, transforms and CSG seams. An arbitrary implicit function or CSG composition does not necessarily give a true Euclidean signed distance; no blanket guarantees of convergence or reliability.
+
+**Evaluation gate:** compare rays and images with independent analytic references and current renderer; record miss-rate, boundary error, steps, throughput and deterministic image fixtures. GPU experiments require MIND-generated GPU compilation, proven provenance and separate numerical qualification; do not present hand-written CUDA benchmark numbers as MIND compiler results. Only then decide whether to implement the optional feature, without modifying the compiler.
