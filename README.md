@@ -221,6 +221,12 @@ mind-ray/
 └── .github/workflows/ci.yml  # MIND build + hash check, CUDA compile check
 ```
 
+## Community
+
+- **Discussions:** <https://github.com/star-ga/mind/discussions> — questions,
+  ideas and help for mind-ray and the wider MIND ecosystem.
+- **Discord:** <https://mindlang.dev/discord> — the MindLang community server.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
