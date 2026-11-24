@@ -2,14 +2,14 @@
 # get_mindc.sh - Download the pinned MIND compiler release into ./toolchain/
 #
 # Usage: ./scripts/get_mindc.sh            (from the repository root)
-#        MINDC_VERSION=v0.10.2 ./scripts/get_mindc.sh
+#        MINDC_VERSION=v0.10.4 ./scripts/get_mindc.sh
 #
 # Downloads mindc-<os>-<arch>.tar.gz from github.com/star-ga/mind releases,
 # verifies it against the published .sha256 file and installs ./toolchain/mindc.
 
 set -euo pipefail
 
-MINDC_VERSION="${MINDC_VERSION:-v0.10.2}"
+MINDC_VERSION="${MINDC_VERSION:-v0.10.4}"
 TOOLCHAIN_DIR="./toolchain"
 
 case "$(uname -s)" in

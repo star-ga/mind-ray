@@ -1,12 +1,12 @@
 # get_mindc.ps1 - Download the pinned MIND compiler release into .\toolchain\
 #
-# Usage (from the repository root): .\scripts\get_mindc.ps1 [-Version v0.10.2]
+# Usage (from the repository root): .\scripts\get_mindc.ps1 [-Version v0.10.4]
 #
 # Downloads mindc-windows-x64.zip from github.com/star-ga/mind releases,
 # verifies it against the published .sha256 file and installs .\toolchain\mindc.exe.
 
 param(
-    [string]$Version = "v0.10.2"
+    [string]$Version = "v0.10.4"
 )
 
 $ErrorActionPreference = "Stop"
