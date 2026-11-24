@@ -16,7 +16,7 @@ find_mindc() {
 }
 
 if mindc_bin="$(find_mindc)" && [ -n "$mindc_bin" ]; then
-    echo "mindc:          $mindc_bin ($("$mindc_bin" --version | head -1))"
+    echo "mindc:          $mindc_bin ($("$mindc_bin" --version | sed -n '1p'))"
 else
     echo "mindc:          MISSING - run ./scripts/get_mindc.sh"
     missing=1

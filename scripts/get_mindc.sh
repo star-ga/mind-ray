@@ -47,4 +47,4 @@ fi
 
 tar -xzf "$tmp/$asset" -C "$tmp"
 install -m 0755 "$tmp/mindc" "$TOOLCHAIN_DIR/mindc"
-echo "Installed $("$TOOLCHAIN_DIR/mindc" --version | head -1) to $TOOLCHAIN_DIR/mindc"
+echo "Installed $("$TOOLCHAIN_DIR/mindc" --version | sed -n '1p') to $TOOLCHAIN_DIR/mindc"
