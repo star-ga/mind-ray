@@ -1,7 +1,7 @@
 // main.mind - MIND-Ray CPU path tracer.
 //
 // A complete, runnable path tracer written in the executable subset of the
-// MIND language that the released `mindc` 0.10.2 compiles to a native binary.
+// MIND language that the released `mindc` 0.10.4 compiles to a native binary.
 //
 //   Scenes:     spheres | cornell | stress   (the presets of the pre-0.10
 //               sources in archive/mind-pre-0.10/scene.mind; spheres adds a

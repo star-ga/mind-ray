@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   mind:
-    name: MIND renderer (mindc v0.10.2)
+    name: MIND renderer (mindc v0.10.4)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:

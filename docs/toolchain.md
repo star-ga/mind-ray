@@ -4,7 +4,7 @@
 
 | Tool | Version | Why |
 |------|---------|-----|
-| `mindc` | v0.10.2 (pinned in `scripts/get_mindc.*`) | Type-checks and compiles `src/main.mind` |
+| `mindc` | v0.10.4 (pinned in `scripts/get_mindc.*`) | Type-checks and compiles `src/main.mind` |
 | `mlir-opt`, `mlir-translate` | LLVM/MLIR 18 or 20 tested; CI uses 20 | `mindc build` lowers MIND through MLIR |
 | `clang` | same LLVM install | Links the native executable |
 | `python3` | any 3.x | Optional: `scripts/ppm_to_png.py` |
@@ -88,7 +88,7 @@ that can JIT the embedded PTX.
 
 `.github/workflows/ci.yml` runs two jobs on every push and pull request:
 
-- **mind**: installs LLVM 20 MLIR tools and `mindc` v0.10.2, then runs
+- **mind**: installs LLVM 20 MLIR tools and `mindc` v0.10.4, then runs
   `./scripts/test.sh` (type-check, build, image hashes).
 - **cuda**: in `nvidia/cuda:13.4.2-devel-ubuntu24.04`, runs
   `./native-cuda/build.sh`.

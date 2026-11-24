@@ -184,7 +184,7 @@ Use `bench/results_template.md` to record your findings. Example:
 
 ### Current Capabilities ✅
 
-1. **Language Viability**: the executable subset of MIND v0.10.2 expresses a complete path tracer
+1. **Language Viability**: the executable subset of MIND v0.10.4 expresses a complete path tracer
 2. **Correctness**: Produces physically plausible images with proper global illumination
 3. **Determinism**: identical image hashes run to run on the same toolchain (checked by `scripts/test.sh`)
 4. **Single module**: one file today; the earlier modular layout is in `archive/mind-pre-0.10/`

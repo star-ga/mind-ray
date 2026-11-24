@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/star-ga/mind-ray/actions/workflows/ci.yml"><img src="https://github.com/star-ga/mind-ray/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
-  <a href="https://github.com/star-ga/mind/releases/tag/v0.10.2"><img src="https://img.shields.io/badge/mindc-v0.10.2-7c3aed.svg" alt="mindc v0.10.2"></a>
+  <a href="https://github.com/star-ga/mind/releases/tag/v0.10.4"><img src="https://img.shields.io/badge/mindc-v0.10.4-7c3aed.svg" alt="mindc v0.10.4"></a>
 </p>
 
 ---
@@ -32,7 +32,7 @@ MIND renderer does not call it.
 
 | Component | State | Verified by |
 |-----------|-------|-------------|
-| MIND renderer | Builds with the released `mindc` v0.10.2 and renders all three scenes | CI: `./scripts/test.sh` (type-check, build, exact image hashes) |
+| MIND renderer | Builds with the released `mindc` v0.10.4 and renders all three scenes | CI: `./scripts/test.sh` (type-check, build, exact image hashes) |
 | CUDA kernels | Compile with CUDA 13.4 for `sm_75`, `sm_86`, `sm_89`, `sm_120` (+ PTX) | CI: `./native-cuda/build.sh` in `nvidia/cuda:13.4.2-devel-ubuntu24.04` |
 | CUDA benchmark host | Windows only (`LoadLibrary`) | Manual; results recorded 2026-01-05 (see below) |
 | Pre-0.10 modular MIND sources | Kept for reference, do not compile with current `mindc` | [`archive/mind-pre-0.10/`](archive/mind-pre-0.10/) |
@@ -67,7 +67,7 @@ cd mind-ray
 sudo apt install mlir-20-tools clang-20
 export PATH=/usr/lib/llvm-20/bin:$PATH
 
-./scripts/get_mindc.sh        # downloads mindc v0.10.2, verifies its SHA-256, installs ./toolchain/mindc
+./scripts/get_mindc.sh        # downloads mindc v0.10.4, verifies its SHA-256, installs ./toolchain/mindc
 ./scripts/check_toolchain.sh  # mindc, mlir-opt, mlir-translate, clang
 ./scripts/build.sh            # mindc check, mindc build --emit cdylib, link with clang
 ./scripts/run.sh cornell 360 360 256 6 42
@@ -105,7 +105,7 @@ cd bench; .\build_bench.bat          # builds cuda_benchmark.exe
 ## How it uses MIND
 
 The renderer is one MIND module written in the subset that the released
-`mindc` v0.10.2 compiles to a native executable through MLIR:
+`mindc` v0.10.4 compiles to a native executable through MLIR:
 
 - **f64 scalar math, i64 integers, `while` loops, `if`/`else`**: vectors are
   three `f64` locals; every operation is a plain add, subtract, multiply or
