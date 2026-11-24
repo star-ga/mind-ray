@@ -7,4 +7,5 @@ description = "MIND-Ray: a deterministic CPU path tracer written in MIND, with a
 
 [build]
 target = "cpu"
+backend = "mlir"
 entry = "src/main.mind"

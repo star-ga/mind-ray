@@ -15,7 +15,7 @@ if ($env:MINDC) {
 & $mindc check src/
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-& $mindc build --release
+& $mindc build --release --backend mlir
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host "Built target\release\mind-ray"

@@ -23,7 +23,7 @@ clang_bin="${CLANG:-clang}"
 out_dir=target/release
 
 "$mindc_bin" check src/
-"$mindc_bin" build --release --emit cdylib
+"$mindc_bin" build --release --backend mlir --emit cdylib
 
 case "$(uname -s)" in
     Darwin) lib="libmind-ray.dylib"; rpath='@loader_path' ;;
